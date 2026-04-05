@@ -589,6 +589,8 @@ const ConnectionPool = struct {
     free_count: u32,
     allocated_hi: u32,
     fd_to_slot: std.AutoHashMapUnmanaged(posix.fd_t, u32) = .{},
+    /// Slot indices with phase != .idle — avoids scanning slots[0..allocated_hi] every tick.
+    timer_live: std.AutoArrayHashMapUnmanaged(u32, void) = .{},
 
     fn init(allocator: std.mem.Allocator, capacity: u32) !ConnectionPool {
         const slots = try allocator.alloc(?*ConnectionSlot, capacity);
@@ -613,8 +615,10 @@ const ConnectionPool = struct {
             .free_count = capacity,
             .allocated_hi = 0,
             .fd_to_slot = .{},
+            .timer_live = .{},
         };
         try pool.fd_to_slot.ensureTotalCapacity(allocator, @as(u32, capacity * 2));
+        try pool.timer_live.ensureTotalCapacity(allocator, capacity);
         return pool;
     }
 
@@ -625,6 +629,7 @@ const ConnectionPool = struct {
             }
         }
         self.fd_to_slot.deinit(self.allocator);
+        self.timer_live.deinit(self.allocator);
         self.allocator.free(self.free_stack);
         self.allocator.free(self.slots);
     }
@@ -650,10 +655,12 @@ const ConnectionPool = struct {
         slot.index = idx;
         slot.client_queue.allocator = self.allocator;
         slot.upstream_queue.allocator = self.allocator;
+        self.timer_live.putAssumeCapacity(idx, {});
         return slot;
     }
 
     fn release(self: *ConnectionPool, slot: *ConnectionSlot) void {
+        _ = self.timer_live.swapRemove(slot.index);
         self.free_stack[self.free_count] = slot.index;
         self.free_count += 1;
         slot.phase = .idle;
@@ -2640,33 +2647,48 @@ const EventLoop = struct {
         const now_ms = std.time.milliTimestamp();
         const now_ns = std.time.nanoTimestamp();
 
-        const hi: usize = @intCast(self.pool.allocated_hi);
-        if (hi == 0) return;
+        const key_src = self.pool.timer_live.keys();
+        if (key_src.len == 0) return;
 
-        var idx: usize = @intCast(self.timer_scan_cursor);
-        if (idx >= hi) idx = 0;
+        const stack_cap: usize = 384;
+        var stack_keys: [stack_cap]u32 = undefined;
+        var heap_keys: ?[]u32 = null;
+        defer if (heap_keys) |h| self.state.allocator.free(h);
 
-        const budget = @min(hi, timer_scan_budget);
-        var scanned: usize = 0;
-        while (scanned < budget) : (scanned += 1) {
-            const slot_opt = self.pool.slots[idx];
-            idx += 1;
-            if (idx >= hi) idx = 0;
+        const indices: []const u32 = if (key_src.len <= stack_cap) blk: {
+            @memcpy(stack_keys[0..key_src.len], key_src);
+            break :blk stack_keys[0..key_src.len];
+        } else blk: {
+            const h = self.state.allocator.alloc(u32, key_src.len) catch return;
+            @memcpy(h, key_src);
+            heap_keys = h;
+            break :blk h;
+        };
 
-            const slot = slot_opt orelse continue;
+        for (indices) |idx| {
+            const slot = self.pool.slots[idx] orelse continue;
             if (slot.phase == .idle) continue;
 
             if (slot.phase == .desync_wait and now_ns >= slot.desync_deadline_ns) {
                 slot.phase = .writing_server_hello_rest;
+                var desync_fail = false;
                 if (slot.server_hello) |sh| {
                     if (slot.server_hello_off < sh.len) {
-                        if (queueClient(slot, self.state.allocator, sh[slot.server_hello_off..])) |_| {} else |_| {
+                        if (queueClient(slot, self.state.allocator, sh[slot.server_hello_off..])) |_| {
+                            slot.server_hello_off = sh.len;
+                        } else |_| {
                             self.closeSlot(slot, "desync rest write failed");
-                            continue;
+                            desync_fail = true;
                         }
-                        slot.server_hello_off = sh.len;
                     }
                 }
+                if (!desync_fail) {
+                    self.syncInterests(slot) catch |err| {
+                        log.debug("[{d}] syncInterests error after desync: {any}", .{ slot.conn_id, err });
+                        self.closeSlot(slot, "sync interest error");
+                    };
+                }
+                continue;
             }
 
             if (slot.phase == .closing) {
@@ -2705,14 +2727,7 @@ const EventLoop = struct {
                     continue;
                 }
             }
-
-            self.syncInterests(slot) catch |err| {
-                log.debug("[{d}] syncInterests error in timer tick: {any}", .{ slot.conn_id, err });
-                self.closeSlot(slot, "sync interest error");
-            };
         }
-
-        self.timer_scan_cursor = @intCast(idx);
     }
 
     fn syncInterests(self: *EventLoop, slot: *ConnectionSlot) !void {
