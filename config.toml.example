@@ -49,6 +49,10 @@ port = 443
 # has enough memory for the configured limits).
 # unsafe_override_limits = false
 
+# Stderr log verbosity: err, warn, info (default), or debug.
+# `debug` prints per-connection tracing and can be very noisy under load.
+# log_level = "info"
+
 [censorship]
 # Domain to impersonate in TLS ServerHello and forward unauthenticated clients to.
 # Choose a popular, high-traffic domain in the target region.

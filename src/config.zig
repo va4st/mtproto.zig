@@ -172,15 +172,7 @@ pub const Config = struct {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.middleproxy_buffer_kb;
                         cfg.middleproxy_buffer_kb = @max(@as(u32, 64), parsed);
                     } else if (std.mem.eql(u8, key, "log_level")) {
-                        if (std.mem.eql(u8, value, "debug")) {
-                            cfg.log_level = .debug;
-                        } else if (std.mem.eql(u8, value, "info")) {
-                            cfg.log_level = .info;
-                        } else if (std.mem.eql(u8, value, "warn")) {
-                            cfg.log_level = .warn;
-                        } else if (std.mem.eql(u8, value, "err")) {
-                            cfg.log_level = .err;
-                        }
+                        if (parseLogLevel(value)) |lvl| cfg.log_level = lvl;
                     } else if (std.mem.eql(u8, key, "rate_limit_per_subnet")) {
                         cfg.rate_limit_per_subnet = std.fmt.parseInt(u8, value, 10) catch cfg.rate_limit_per_subnet;
                     } else if (std.mem.eql(u8, key, "unsafe_override_limits")) {
@@ -205,6 +197,16 @@ pub const Config = struct {
         }
 
         return cfg;
+    }
+
+    fn parseLogLevel(raw: []const u8) ?std.log.Level {
+        const v = std.mem.trim(u8, raw, &[_]u8{ ' ', '\t', '\r' });
+        if (v.len == 0) return null;
+        if (std.ascii.eqlIgnoreCase(v, "err") or std.ascii.eqlIgnoreCase(v, "error")) return .err;
+        if (std.ascii.eqlIgnoreCase(v, "warn") or std.ascii.eqlIgnoreCase(v, "warning")) return .warn;
+        if (std.ascii.eqlIgnoreCase(v, "info")) return .info;
+        if (std.ascii.eqlIgnoreCase(v, "debug")) return .debug;
+        return null;
     }
 
     pub fn deinit(self: *const Config, allocator: std.mem.Allocator) void {
@@ -302,6 +304,21 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u8, 8), cfg.rate_limit_per_subnet);
     try std.testing.expect(!cfg.unsafe_override_limits);
     try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
+    try std.testing.expectEqual(std.log.Level.info, cfg.log_level);
+}
+
+test "parse config - log_level" {
+    const content =
+        \\[server]
+        \\log_level = DEBUG
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(std.log.Level.debug, cfg.log_level);
 }
 
 test "parse config - middleproxy buffer size" {

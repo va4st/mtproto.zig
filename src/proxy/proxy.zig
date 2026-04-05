@@ -1777,7 +1777,12 @@ const EventLoop = struct {
         slot.upstream_candidate_next = 1;
         slot.current_upstream_addr = candidates[0];
 
-        self.startConnectUpstream(slot, candidates[0], .dc) catch {
+        self.startConnectUpstream(slot, candidates[0], .dc) catch |e| {
+            var addr_buf: [64]u8 = undefined;
+            const addr_str = formatAddress(candidates[0], &addr_buf);
+            log.warn("[{d}] upstream connect start failed: {any} dc={d} peer={s}", .{
+                slot.conn_id, e, slot.dc_abs, addr_str,
+            });
             self.closeSlot(slot, "upstream connect start failed");
         };
     }
@@ -1823,18 +1828,27 @@ const EventLoop = struct {
 
     fn onUpstreamConnectComplete(self: *EventLoop, slot: *ConnectionSlot) void {
         if (posix.getsockoptError(slot.upstream_fd)) |_| {} else |err| {
+            const failed_kind = slot.upstream_kind;
+            const failed_addr = slot.current_upstream_addr;
             self.cleanupFailedUpstreamConnect(slot);
 
-            if (slot.upstream_kind == .dc and self.tryNextDcEndpoint(slot, err)) {
+            if (failed_kind == .dc and self.tryNextDcEndpoint(slot, err, failed_addr)) {
                 return;
             }
 
-            log.debug("[{d}] connect completion failed: dc_idx={d} media={} err={any}", .{
-                slot.conn_id,
-                slot.dc_idx,
-                slot.is_media_path,
-                err,
-            });
+            if (failed_kind == .dc) {
+                var ab: [64]u8 = undefined;
+                const peer_str = if (failed_addr) |a| formatAddress(a, &ab) else "unknown";
+                log.warn("[{d}] dc unreachable after retries: {any} dc={d} last_peer={s}", .{
+                    slot.conn_id, err, slot.dc_abs, peer_str,
+                });
+            } else if (failed_kind == .mask) {
+                var ab: [64]u8 = undefined;
+                const peer_str = if (failed_addr) |a| formatAddress(a, &ab) else "unknown";
+                log.warn("[{d}] mask upstream connect failed: {any} peer={s}", .{ slot.conn_id, err, peer_str });
+            }
+
+            log.debug("[{d}] connect completion failed: {any}", .{ slot.conn_id, err });
             self.closeSlot(slot, "connect failed");
             return;
         }
@@ -1880,8 +1894,7 @@ const EventLoop = struct {
         slot.upstream_queue.clear();
     }
 
-    fn tryNextDcEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror) bool {
-        const attempt_addr = slot.current_upstream_addr;
+    fn tryNextDcEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror, last_failed_peer: ?net.Address) bool {
         const candidates = slot.upstream_candidates orelse return false;
         const candidate_count = slotCandidateCount(slot);
 
@@ -1890,24 +1903,41 @@ const EventLoop = struct {
             const next_addr = candidates[next_idx];
             slot.upstream_candidate_next += 1;
             self.startConnectUpstream(slot, next_addr, .dc) catch |next_err| {
-                log.warn("[{d}] dc connect candidate {d}/{d} failed immediately: {any}", .{
+                var peer_buf: [64]u8 = undefined;
+                const peer_str = formatAddress(next_addr, &peer_buf);
+                log.warn("[{d}] dc connect candidate {d}/{d} failed immediately: {any} dc={d} peer={s}", .{
                     slot.conn_id,
                     next_idx + 1,
                     candidate_count,
                     next_err,
+                    slot.dc_abs,
+                    peer_str,
                 });
-                return self.tryNextDcEndpoint(slot, next_err);
+                return self.tryNextDcEndpoint(slot, next_err, next_addr);
             };
 
-            if (attempt_addr) |addr| {
+            var next_buf: [64]u8 = undefined;
+            const next_str = formatAddress(next_addr, &next_buf);
+            if (last_failed_peer) |addr| {
                 var prev_buf: [64]u8 = undefined;
                 const prev_str = formatAddress(addr, &prev_buf);
-                log.warn("[{d}] dc connect failed ({any}), retry candidate {d}/{d} after {s}", .{
+                log.warn("[{d}] dc connect failed ({any}) dc={d} failed_peer={s} retry {d}/{d} next_peer={s}", .{
                     slot.conn_id,
                     err,
+                    slot.dc_abs,
+                    prev_str,
                     next_idx + 1,
                     candidate_count,
-                    prev_str,
+                    next_str,
+                });
+            } else {
+                log.warn("[{d}] dc connect failed ({any}) dc={d} retry {d}/{d} next_peer={s}", .{
+                    slot.conn_id,
+                    err,
+                    slot.dc_abs,
+                    next_idx + 1,
+                    candidate_count,
+                    next_str,
                 });
             }
             return true;
@@ -1929,19 +1959,27 @@ const EventLoop = struct {
             one[0] = fallback;
             slot.upstream_candidates = one;
 
+            var fb_log: [64]u8 = undefined;
+            const fb_peer = formatAddress(fallback, &fb_log);
             self.startConnectUpstream(slot, fallback, .dc) catch |fallback_err| {
-                log.warn("[{d}] direct fallback connect failed: {any}", .{ slot.conn_id, fallback_err });
+                log.warn("[{d}] direct fallback connect failed: {any} dc={d} peer={s}", .{
+                    slot.conn_id, fallback_err, slot.dc_abs, fb_peer,
+                });
                 return false;
             };
 
-            var fb_buf: [64]u8 = undefined;
-            const fb_str = formatAddress(fallback, &fb_buf);
-            log.warn("[{d}] middle-proxy exhausted, fallback to direct {s}", .{ slot.conn_id, fb_str });
+            log.warn("[{d}] middle-proxy exhausted, fallback to direct dc={d} peer={s}", .{
+                slot.conn_id, slot.dc_abs, fb_peer,
+            });
             return true;
         }
 
         if (slot.is_media_path) {
-            log.warn("[{d}] media path connect failed after all candidates: {any}", .{ slot.conn_id, err });
+            var mf_buf: [64]u8 = undefined;
+            const mf_peer = if (last_failed_peer) |a| formatAddress(a, &mf_buf) else "unknown";
+            log.warn("[{d}] media path connect failed after all candidates: {any} dc={d} last_peer={s}", .{
+                slot.conn_id, err, slot.dc_abs, mf_peer,
+            });
         }
         return false;
     }
@@ -2477,13 +2515,19 @@ const EventLoop = struct {
         slot.upstream_candidates = one;
 
         self.startConnectUpstream(slot, fallback, .dc) catch |err| {
-            log.warn("[{d}] direct fallback connect start failed: {any}", .{ slot.conn_id, err });
+            var fb_buf: [64]u8 = undefined;
+            const fb_str = formatAddress(fallback, &fb_buf);
+            log.warn("[{d}] direct fallback connect start failed: {any} dc={d} peer={s}", .{
+                slot.conn_id, err, slot.dc_abs, fb_str,
+            });
             return false;
         };
 
         var fb_buf: [64]u8 = undefined;
         const fb_str = formatAddress(fallback, &fb_buf);
-        log.warn("[{d}] middle-proxy handshake failed, reconnecting direct to {s}", .{ slot.conn_id, fb_str });
+        log.warn("[{d}] middle-proxy handshake failed, reconnecting direct dc={d} peer={s}", .{
+            slot.conn_id, slot.dc_abs, fb_str,
+        });
         return true;
     }
 
@@ -2629,6 +2673,20 @@ const EventLoop = struct {
                     }
                 } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
                     _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
+                    switch (slot.phase) {
+                        .connecting_upstream, .middle_proxy_handshake => {
+                            var ub: [64]u8 = undefined;
+                            const peer_s = if (slot.current_upstream_addr) |a| formatAddress(a, &ub) else "unknown";
+                            log.warn("[{d}] handshake timeout peer={s} dc={d} phase={s}", .{
+                                slot.conn_id, peer_s, slot.dc_abs, @tagName(slot.phase),
+                            });
+                        },
+                        else => {
+                            log.warn("[{d}] handshake timeout dc={d} phase={s}", .{
+                                slot.conn_id, slot.dc_abs, @tagName(slot.phase),
+                            });
+                        },
+                    }
                     self.closeSlot(slot, "handshake timeout");
                     continue;
                 }
