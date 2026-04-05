@@ -12,19 +12,21 @@ const tls = @import("protocol/tls.zig");
 const config = @import("config.zig");
 const proxy = @import("proxy/proxy.zig");
 
+/// Effective `std.log` level after config is loaded (ordinal of `std.log.Level`).
+/// Before `main` applies `[server].log_level`, this defaults to `.info`.
+var runtime_log_level = std.atomic.Value(u8).init(@intFromEnum(std.log.Level.info));
+
 // Custom lock-free log function: formats into a stack buffer and writes
 // to stderr in a single write() syscall. On Linux, write() is atomic for
 // sizes <= PIPE_BUF (4096 bytes), so messages from different threads
 // don't interleave. This avoids the global stderr_mutex that Zig's
 // default logger uses, which causes catastrophic contention under
 // hundreds of concurrent threads.
-// Runtime log level, set from config.toml at startup.
-// Checked by lockFreeLog to filter messages without recompilation.
-pub var runtime_log_level: std.log.Level = .info;
+// Runtime threshold is stored in `runtime_log_level` and applied in `lockFreeLog`.
 
 pub const std_options = std.Options{
-    // Set comptime level to .debug so all log calls are compiled in.
-    // Runtime filtering is done in lockFreeLog via runtime_log_level.
+    // `.debug` at compile time keeps `log.debug` sites in the binary; runtime
+    // filtering uses `runtime_log_level` (from config) inside `lockFreeLog`.
     .log_level = .debug,
     .logFn = lockFreeLog,
 };
@@ -35,8 +37,8 @@ fn lockFreeLog(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    // Runtime filter: skip messages below configured level
-    if (@intFromEnum(message_level) > @intFromEnum(runtime_log_level)) return;
+    const threshold = runtime_log_level.load(.monotonic);
+    if (@intFromEnum(message_level) > threshold) return;
 
     const level_txt = comptime message_level.asText();
     const prefix2 = comptime if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
@@ -370,8 +372,7 @@ pub fn main() !void {
     };
     defer cfg.deinit(allocator);
 
-    // Apply runtime log level from config
-    runtime_log_level = cfg.log_level;
+    runtime_log_level.store(@intFromEnum(cfg.log_level), .monotonic);
 
     if (!std.crypto.core.aes.has_hardware_support and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64)) {
         const log_main = std.log.scoped(.config);
