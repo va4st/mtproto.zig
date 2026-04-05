@@ -34,6 +34,8 @@ const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 4096;
+/// Max relay read/write steps per fd per epoll batch (fairness + lower syscall churn).
+const relay_spin_cap: u32 = 512;
 
 /// Per-/24 (IPv4) or /48 (IPv6) subnet rate limiter.
 /// Fixed 256-bucket hash table — zero heap allocation.
@@ -2130,77 +2132,86 @@ const EventLoop = struct {
     }
 
     fn relayClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
-        if (slot.hasUpstreamPending()) return;
-
-        const progress = relayClientToUpstreamStep(slot, self.state.allocator) catch |err| {
-            warnSlotUpstream(slot, "relay c2s", err);
-            self.closeSlot(slot, "relay c2s failed");
-            return;
-        };
-        if (progress == .forwarded or progress == .partial) {
-            slot.last_activity_ms = std.time.milliTimestamp();
+        var spins: u32 = 0;
+        while (!slot.hasUpstreamPending() and spins < relay_spin_cap) : (spins += 1) {
+            const progress = relayClientToUpstreamStep(slot, self.state.allocator) catch |err| {
+                warnSlotUpstream(slot, "relay c2s", err);
+                self.closeSlot(slot, "relay c2s failed");
+                return;
+            };
+            if (progress == .forwarded or progress == .partial) {
+                slot.last_activity_ms = std.time.milliTimestamp();
+            }
+            if (progress != .forwarded) break;
         }
     }
 
     fn relayUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
-        if (slot.hasClientPending()) return;
-
-        const progress = relayUpstreamToClientStep(slot, self.state.allocator) catch |err| {
-            warnSlotUpstream(slot, "relay s2c", err);
-            self.closeSlot(slot, "relay s2c failed");
-            return;
-        };
-        if (progress == .forwarded or progress == .partial) {
-            slot.last_activity_ms = std.time.milliTimestamp();
+        var spins: u32 = 0;
+        while (!slot.hasClientPending() and spins < relay_spin_cap) : (spins += 1) {
+            const progress = relayUpstreamToClientStep(slot, self.state.allocator) catch |err| {
+                warnSlotUpstream(slot, "relay s2c", err);
+                self.closeSlot(slot, "relay s2c failed");
+                return;
+            };
+            if (progress == .forwarded or progress == .partial) {
+                slot.last_activity_ms = std.time.milliTimestamp();
+            }
+            switch (progress) {
+                .none => break,
+                .forwarded, .partial => continue,
+            }
         }
     }
 
     fn relayRawClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
-        if (slot.hasUpstreamPending()) return;
+        var spins: u32 = 0;
+        while (!slot.hasUpstreamPending() and spins < relay_spin_cap) : (spins += 1) {
+            const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
+                slot.phase = .closing;
+                return;
+            };
 
-        const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-            slot.phase = .closing;
-            return;
-        };
+            const n = posix.read(slot.client_fd, read_buf) catch |err| {
+                if (err == error.WouldBlock) return;
+                slot.phase = .closing;
+                return;
+            };
+            if (n == 0) {
+                slot.phase = .closing;
+                return;
+            }
 
-        const n = posix.read(slot.client_fd, read_buf) catch |err| {
-            if (err == error.WouldBlock) return;
-            slot.phase = .closing;
-            return;
-        };
-        if (n == 0) {
-            slot.phase = .closing;
-            return;
+            _ = queueUpstream(slot, self.state.allocator, read_buf[0..n]) catch {
+                slot.phase = .closing;
+                return;
+            };
         }
-
-        _ = queueUpstream(slot, self.state.allocator, read_buf[0..n]) catch {
-            slot.phase = .closing;
-            return;
-        };
     }
 
     fn relayRawUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
-        if (slot.hasClientPending()) return;
+        var spins: u32 = 0;
+        while (!slot.hasClientPending() and spins < relay_spin_cap) : (spins += 1) {
+            const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
+                slot.phase = .closing;
+                return;
+            };
 
-        const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-            slot.phase = .closing;
-            return;
-        };
+            const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
+                if (err == error.WouldBlock) return;
+                slot.phase = .closing;
+                return;
+            };
+            if (n == 0) {
+                slot.phase = .closing;
+                return;
+            }
 
-        const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
-            if (err == error.WouldBlock) return;
-            slot.phase = .closing;
-            return;
-        };
-        if (n == 0) {
-            slot.phase = .closing;
-            return;
+            _ = queueClient(slot, self.state.allocator, read_buf[0..n]) catch {
+                slot.phase = .closing;
+                return;
+            };
         }
-
-        _ = queueClient(slot, self.state.allocator, read_buf[0..n]) catch {
-            slot.phase = .closing;
-            return;
-        };
     }
 
     fn middleProxyBegin(self: *EventLoop, slot: *ConnectionSlot) void {
