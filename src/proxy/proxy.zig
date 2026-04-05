@@ -1713,6 +1713,9 @@ const EventLoop = struct {
             return;
         }
 
+        var peer_buf_tls: [64]u8 = undefined;
+        const peer_str_tls = formatAddress(slot.peer_addr, &peer_buf_tls);
+
         const validation = tls.validateTlsHandshake(
             self.state.allocator,
             client_hello,
@@ -1721,6 +1724,11 @@ const EventLoop = struct {
         ) catch null;
 
         if (validation == null) {
+            log.debug("[{d}] ({s}) TLS auth failed — masking to {s}", .{
+                slot.conn_id,
+                peer_str_tls,
+                self.state.config.tls_domain,
+            });
             self.startMasking(slot, client_hello) catch {
                 self.closeSlot(slot, "tls validation failed");
             };
@@ -1729,11 +1737,18 @@ const EventLoop = struct {
 
         const v = validation.?;
         if (self.state.replay_cache.checkAndInsert(&v.canonical_hmac)) {
+            log.warn("[{d}] ({s}) Replay attack detected (ТСПУ Revisor) — masking to {s}", .{
+                slot.conn_id,
+                peer_str_tls,
+                self.state.config.tls_domain,
+            });
             self.startMasking(slot, client_hello) catch {
                 self.closeSlot(slot, "replay detected, masking failed");
             };
             return;
         }
+
+        log.info("[{d}] ({s}) TLS auth OK: user={s}", .{ slot.conn_id, peer_str_tls, v.user });
 
         slot.validation_secret = v.secret;
         slot.validation_digest = v.digest;
@@ -2300,6 +2315,7 @@ const EventLoop = struct {
             null;
 
         const progress = relayClientToUpstreamStep(slot, self.state.allocator, mp_c2s_scratch) catch |err| {
+            warnSlotUpstream(slot, "relay c2s", err);
             if (slot.is_media_path) {
                 log.debug("[{d}] relay c2s error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
                     slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
@@ -2325,6 +2341,7 @@ const EventLoop = struct {
             null;
 
         const progress = relayUpstreamToClientStep(slot, self.state.allocator, mp_s2c_scratch) catch |err| {
+            warnSlotUpstream(slot, "relay s2c", err);
             if (slot.is_media_path) {
                 log.debug("[{d}] relay s2c error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
                     slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
@@ -2445,7 +2462,7 @@ const EventLoop = struct {
         switch (slot.mp_step) {
             .waiting_rpc_nonce_response => {
                 const payload = self.mpTryReadFrame(slot, false) catch |err| {
-                    log.debug("[{d}] mp nonce frame read failed: {any}", .{ slot.conn_id, err });
+                    warnSlotUpstream(slot, "mp read nonce ans", err);
                     self.closeSlot(slot, "mp read nonce ans failed");
                     return;
                 } orelse return;
@@ -2596,7 +2613,7 @@ const EventLoop = struct {
 
             .waiting_rpc_handshake_response => {
                 const payload = self.mpTryReadFrame(slot, true) catch |err| {
-                    log.debug("[{d}] mp handshake frame read failed: {any}", .{ slot.conn_id, err });
+                    warnSlotUpstream(slot, "mp read handshake ans", err);
                     if (!self.fallbackFromMiddleProxyToDirect(slot)) {
                         self.closeSlot(slot, "mp read handshake ans failed");
                     }
@@ -3379,26 +3396,34 @@ fn configureRelaySocket(fd: posix.fd_t) void {
     setSendTimeout(fd, 30);
 }
 
+/// Log relay / middle-proxy failures with resolved upstream endpoint (works at `info`).
+fn warnSlotUpstream(slot: *const ConnectionSlot, context: []const u8, err: anyerror) void {
+    var buf: [64]u8 = undefined;
+    const peer_s = if (slot.current_upstream_addr) |a| formatAddress(a, &buf) else "unknown";
+    log.warn("[{d}] {s}: {any} dc={d} upstream={s}", .{ slot.conn_id, context, err, slot.dc_abs, peer_s });
+}
+
 fn formatAddress(addr: net.Address, buf: *[64]u8) []const u8 {
     switch (addr.any.family) {
         posix.AF.INET => {
-            return std.fmt.bufPrint(buf, "[ipv4]:{d}", .{
-                std.mem.bigToNative(u16, addr.in.sa.port),
+            const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
+            const port = std.mem.bigToNative(u16, addr.in.sa.port);
+            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
+                bytes[0], bytes[1], bytes[2], bytes[3], port,
             }) catch "?";
         },
         posix.AF.INET6 => {
             const bytes: *const [16]u8 = @ptrCast(&addr.in6.sa.addr);
+            const port = std.mem.bigToNative(u16, addr.in6.sa.port);
             const is_ipv4_mapped = std.mem.eql(u8, bytes[0..10], &[_]u8{0} ** 10) and
                 std.mem.eql(u8, bytes[10..12], &[_]u8{ 0xff, 0xff });
 
             if (is_ipv4_mapped) {
-                return std.fmt.bufPrint(buf, "[ipv4]:{d}", .{
-                    std.mem.bigToNative(u16, addr.in6.sa.port),
+                return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
+                    bytes[12], bytes[13], bytes[14], bytes[15], port,
                 }) catch "?";
             }
-            return std.fmt.bufPrint(buf, "[ipv6]:{d}", .{
-                std.mem.bigToNative(u16, addr.in6.sa.port),
-            }) catch "?";
+            return std.fmt.bufPrint(buf, "[ipv6]:{d}", .{port}) catch "?";
         },
         else => return "?",
     }
