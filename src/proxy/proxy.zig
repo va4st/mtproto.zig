@@ -1292,6 +1292,10 @@ const EventLoop = struct {
         const timer_tick_ns: i128 = 5 * std.time.ns_per_ms;
         var next_timer_tick_ns: i128 = std.time.nanoTimestamp();
 
+        var epoll_calls: u64 = 0;
+        var epoll_events_total: u64 = 0;
+        var last_stats_ns: i128 = std.time.nanoTimestamp();
+
         while (true) {
             const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), event_loop_wait_ms);
             switch (posix.errno(rc)) {
@@ -1301,6 +1305,8 @@ const EventLoop = struct {
             }
 
             const n: usize = @intCast(rc);
+            epoll_calls += 1;
+            epoll_events_total += n;
             for (events[0..n]) |ev| {
                 const fd = ev.data.fd;
                 const ev_flags = ev.events;
@@ -1332,7 +1338,15 @@ const EventLoop = struct {
                 next_timer_tick_ns = now_ns + timer_tick_ns;
             }
             if (now_ns >= self.stats_next_log_ns) {
+                const elapsed_ns = now_ns - last_stats_ns;
+                const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+                const epoll_per_sec = @as(f64, @floatFromInt(epoll_calls)) / elapsed_s;
+                const events_per_call = if (epoll_calls > 0) @as(f64, @floatFromInt(epoll_events_total)) / @as(f64, @floatFromInt(epoll_calls)) else 0;
+                log.info("epoll_wait: {d:.1f} calls/sec, {d:.2f} events/call, {d} total events", .{ epoll_per_sec, events_per_call, epoll_events_total });
                 self.logPeriodicStats(now_ns);
+                epoll_calls = 0;
+                epoll_events_total = 0;
+                last_stats_ns = now_ns;
             }
         }
     }
