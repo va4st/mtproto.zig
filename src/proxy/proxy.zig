@@ -2710,25 +2710,23 @@ const EventLoop = struct {
             if (slot.handshakeInProgress()) {
                 if (slot.first_byte_at_ms == 0) {
                     if (now_ms - slot.created_at_ms > secondsToMs(self.state.config.idle_timeout_sec)) {
+                        var cb: [64]u8 = undefined;
+                        const client_s = formatAddress(slot.peer_addr, &cb);
+                        log.warn("[{d}] idle pre-first-byte timeout client={s} phase={s}", .{
+                            slot.conn_id, client_s, @tagName(slot.phase),
+                        });
                         self.closeSlot(slot, "idle pre-first-byte timeout");
                         continue;
                     }
                 } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
                     _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
-                    switch (slot.phase) {
-                        .connecting_upstream, .middle_proxy_handshake => {
-                            var ub: [64]u8 = undefined;
-                            const peer_s = if (slot.current_upstream_addr) |a| formatAddress(a, &ub) else "unknown";
-                            log.warn("[{d}] handshake timeout peer={s} dc={d} phase={s}", .{
-                                slot.conn_id, peer_s, slot.dc_abs, @tagName(slot.phase),
-                            });
-                        },
-                        else => {
-                            log.warn("[{d}] handshake timeout dc={d} phase={s}", .{
-                                slot.conn_id, slot.dc_abs, @tagName(slot.phase),
-                            });
-                        },
-                    }
+                    var cb: [64]u8 = undefined;
+                    const client_s = formatAddress(slot.peer_addr, &cb);
+                    var ub: [64]u8 = undefined;
+                    const upstream_s = if (slot.current_upstream_addr) |a| formatAddress(a, &ub) else "-";
+                    log.warn("[{d}] handshake timeout client={s} upstream={s} dc={d} phase={s}", .{
+                        slot.conn_id, client_s, upstream_s, slot.dc_abs, @tagName(slot.phase),
+                    });
                     self.closeSlot(slot, "handshake timeout");
                     continue;
                 }
