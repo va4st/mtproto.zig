@@ -36,6 +36,8 @@ const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 4096;
 /// Max relay read/write steps per fd per epoll batch (fairness + lower syscall churn).
 const relay_spin_cap: u32 = 512;
+/// Min interval between `warn` logs for the same client IP (handshake / pre-byte idle spam).
+const client_warn_throttle_ms: i64 = 30_000;
 
 /// Per-/24 (IPv4) or /48 (IPv6) subnet rate limiter.
 /// Fixed 256-bucket hash table — zero heap allocation.
@@ -687,6 +689,29 @@ fn slotCandidateCount(slot: *const ConnectionSlot) usize {
     return 0;
 }
 
+/// Stable key for log throttling by remote host (port ignored).
+fn peerThrottleKey(addr: net.Address) ?u128 {
+    var norm: [16]u8 = [_]u8{0} ** 16;
+    switch (addr.any.family) {
+        posix.AF.INET => {
+            const b: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
+            @memcpy(norm[0..4], b);
+        },
+        posix.AF.INET6 => {
+            const b: *const [16]u8 = @ptrCast(&addr.in6.sa.addr);
+            const is_ipv4_mapped = std.mem.eql(u8, b[0..10], &[_]u8{0} ** 10) and
+                std.mem.eql(u8, b[10..12], &[_]u8{ 0xff, 0xff });
+            if (is_ipv4_mapped) {
+                @memcpy(norm[0..4], b[12..16]);
+            } else {
+                @memcpy(norm[0..16], b);
+            }
+        },
+        else => return null,
+    }
+    return std.hash.Wyhash.hash(0, &norm);
+}
+
 pub const ProxyState = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -715,6 +740,10 @@ pub const ProxyState = struct {
     middle_proxy_secret: [256]u8,
     middle_proxy_secret_len: usize,
     middle_proxy_nat_ip4: ?[4]u8,
+
+    /// Rate-limit identical client warnings (e.g. burst of slow/incomplete ClientHello).
+    handshake_warn_mu: std.Thread.Mutex = .{},
+    handshake_warn_by_peer: std.AutoArrayHashMapUnmanaged(u128, i64) = .{},
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
@@ -754,7 +783,7 @@ pub const ProxyState = struct {
             log.info("Detected public IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(ip, &ip_buf)});
         }
 
-        return .{
+        var st: ProxyState = .{
             .allocator = allocator,
             .config = cfg,
             .user_secrets = secrets.toOwnedSlice(allocator) catch &.{},
@@ -778,10 +807,34 @@ pub const ProxyState = struct {
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
+            .handshake_warn_mu = .{},
+            .handshake_warn_by_peer = .{},
         };
+        st.handshake_warn_by_peer.ensureTotalCapacity(allocator, 512) catch {};
+        return st;
+    }
+
+    /// Returns false if the same peer was already warned within `interval_ms` (anti-spam in logs).
+    pub fn shouldLogWarnForPeer(self: *ProxyState, peer: net.Address, now_ms: i64, interval_ms: i64) bool {
+        const key = peerThrottleKey(peer) orelse return true;
+        self.handshake_warn_mu.lock();
+        defer self.handshake_warn_mu.unlock();
+
+        if (self.handshake_warn_by_peer.getPtr(key)) |last| {
+            if (now_ms - last.* < interval_ms) return false;
+            last.* = now_ms;
+            return true;
+        }
+
+        if (self.handshake_warn_by_peer.count() >= 4096) {
+            self.handshake_warn_by_peer.clearRetainingCapacity();
+        }
+        self.handshake_warn_by_peer.put(self.allocator, key, now_ms) catch return true;
+        return true;
     }
 
     pub fn deinit(self: *ProxyState) void {
+        self.handshake_warn_by_peer.deinit(self.allocator);
         self.allocator.free(self.user_secrets);
     }
 
@@ -2712,9 +2765,15 @@ const EventLoop = struct {
                     if (now_ms - slot.created_at_ms > secondsToMs(self.state.config.idle_timeout_sec)) {
                         var cb: [64]u8 = undefined;
                         const client_s = formatAddress(slot.peer_addr, &cb);
-                        log.warn("[{d}] idle pre-first-byte timeout client={s} phase={s}", .{
-                            slot.conn_id, client_s, @tagName(slot.phase),
-                        });
+                        if (self.state.shouldLogWarnForPeer(slot.peer_addr, now_ms, client_warn_throttle_ms)) {
+                            log.warn("[{d}] idle pre-first-byte timeout client={s} phase={s}", .{
+                                slot.conn_id, client_s, @tagName(slot.phase),
+                            });
+                        } else {
+                            log.debug("[{d}] idle pre-first-byte timeout client={s} phase={s} (warn throttled)", .{
+                                slot.conn_id, client_s, @tagName(slot.phase),
+                            });
+                        }
                         self.closeSlot(slot, "idle pre-first-byte timeout");
                         continue;
                     }
@@ -2724,9 +2783,15 @@ const EventLoop = struct {
                     const client_s = formatAddress(slot.peer_addr, &cb);
                     var ub: [64]u8 = undefined;
                     const upstream_s = if (slot.current_upstream_addr) |a| formatAddress(a, &ub) else "-";
-                    log.warn("[{d}] handshake timeout client={s} upstream={s} dc={d} phase={s}", .{
-                        slot.conn_id, client_s, upstream_s, slot.dc_abs, @tagName(slot.phase),
-                    });
+                    if (self.state.shouldLogWarnForPeer(slot.peer_addr, now_ms, client_warn_throttle_ms)) {
+                        log.warn("[{d}] handshake timeout client={s} upstream={s} dc={d} phase={s}", .{
+                            slot.conn_id, client_s, upstream_s, slot.dc_abs, @tagName(slot.phase),
+                        });
+                    } else {
+                        log.debug("[{d}] handshake timeout client={s} upstream={s} dc={d} phase={s} (warn throttled)", .{
+                            slot.conn_id, client_s, upstream_s, slot.dc_abs, @tagName(slot.phase),
+                        });
+                    }
                     self.closeSlot(slot, "handshake timeout");
                     continue;
                 }
