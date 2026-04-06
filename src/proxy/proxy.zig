@@ -37,6 +37,7 @@ const read_buf_size: usize = 4096;
 /// Max relay read/write steps per fd per epoll batch (fairness + lower syscall churn).
 const relay_spin_cap: u32 = 512;
 /// Min interval between `warn` logs for the same client IP (handshake / pre-byte idle spam).
+/// While throttled, idle/handshake timeouts close the slot without per-connection debug lines.
 const client_warn_throttle_ms: i64 = 30_000;
 
 /// Per-/24 (IPv4) or /48 (IPv6) subnet rate limiter.
@@ -2765,16 +2766,13 @@ const EventLoop = struct {
                     if (now_ms - slot.created_at_ms > secondsToMs(self.state.config.idle_timeout_sec)) {
                         var cb: [64]u8 = undefined;
                         const client_s = formatAddress(slot.peer_addr, &cb);
-                        if (self.state.shouldLogWarnForPeer(slot.peer_addr, now_ms, client_warn_throttle_ms)) {
+                        const log_client = self.state.shouldLogWarnForPeer(slot.peer_addr, now_ms, client_warn_throttle_ms);
+                        if (log_client) {
                             log.warn("[{d}] idle pre-first-byte timeout client={s} phase={s}", .{
                                 slot.conn_id, client_s, @tagName(slot.phase),
                             });
-                        } else {
-                            log.debug("[{d}] idle pre-first-byte timeout client={s} phase={s} (warn throttled)", .{
-                                slot.conn_id, client_s, @tagName(slot.phase),
-                            });
                         }
-                        self.closeSlot(slot, "idle pre-first-byte timeout");
+                        self.closeSlotMaybeLog(slot, "idle pre-first-byte timeout", log_client);
                         continue;
                     }
                 } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
@@ -2783,16 +2781,13 @@ const EventLoop = struct {
                     const client_s = formatAddress(slot.peer_addr, &cb);
                     var ub: [64]u8 = undefined;
                     const upstream_s = if (slot.current_upstream_addr) |a| formatAddress(a, &ub) else "-";
-                    if (self.state.shouldLogWarnForPeer(slot.peer_addr, now_ms, client_warn_throttle_ms)) {
+                    const log_client = self.state.shouldLogWarnForPeer(slot.peer_addr, now_ms, client_warn_throttle_ms);
+                    if (log_client) {
                         log.warn("[{d}] handshake timeout client={s} upstream={s} dc={d} phase={s}", .{
                             slot.conn_id, client_s, upstream_s, slot.dc_abs, @tagName(slot.phase),
                         });
-                    } else {
-                        log.debug("[{d}] handshake timeout client={s} upstream={s} dc={d} phase={s} (warn throttled)", .{
-                            slot.conn_id, client_s, upstream_s, slot.dc_abs, @tagName(slot.phase),
-                        });
                     }
-                    self.closeSlot(slot, "handshake timeout");
+                    self.closeSlotMaybeLog(slot, "handshake timeout", log_client);
                     continue;
                 }
             } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
@@ -2879,16 +2874,12 @@ const EventLoop = struct {
     }
 
     fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
+        self.closeSlotMaybeLog(slot, reason, true);
+    }
+
+    fn closeSlotMaybeLog(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8, log_reason: bool) void {
         if (slot.phase == .idle) return;
-        log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d}", .{
-            slot.conn_id,
-            slot.dc_idx,
-            slot.is_media_path,
-            @tagName(slot.phase),
-            reason,
-            slot.c2s_bytes,
-            slot.s2c_bytes,
-        });
+        if (log_reason) log.debug("[{d}] closing: {s}", .{ slot.conn_id, reason });
 
         if (slot.client_fd != -1) {
             _ = self.delFd(slot.client_fd) catch {};
