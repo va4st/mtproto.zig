@@ -1297,7 +1297,11 @@ const EventLoop = struct {
         var last_stats_ns: i128 = std.time.nanoTimestamp();
 
         while (true) {
+            const before_epoll_ns = std.time.nanoTimestamp();
             const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), event_loop_wait_ms);
+            const after_epoll_ns = std.time.nanoTimestamp();
+            const epoll_took_us = (after_epoll_ns - before_epoll_ns) / 1000;
+
             switch (posix.errno(rc)) {
                 .SUCCESS => {},
                 .INTR => continue,
@@ -1307,6 +1311,13 @@ const EventLoop = struct {
             const n: usize = @intCast(rc);
             epoll_calls += 1;
             epoll_events_total += n;
+
+            // Log if epoll_wait returned very quickly (instant ready, not blocking)
+            if (epoll_took_us < 100 and n > 0) {
+                if (epoll_calls % 100000 == 0) {
+                    log.debug("epoll_wait instant return: {d} events in {d}us (n={d})", .{ epoll_calls, epoll_took_us, n });
+                }
+            }
             for (events[0..n]) |ev| {
                 const fd = ev.data.fd;
                 const ev_flags = ev.events;
