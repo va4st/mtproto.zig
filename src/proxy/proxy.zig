@@ -1342,7 +1342,7 @@ const EventLoop = struct {
                 const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
                 const epoll_per_sec = @as(f64, @floatFromInt(epoll_calls)) / elapsed_s;
                 const events_per_call = if (epoll_calls > 0) @as(f64, @floatFromInt(epoll_events_total)) / @as(f64, @floatFromInt(epoll_calls)) else 0;
-                log.info("epoll_wait: {d:.1f} calls/sec, {d:.2f} events/call, {d} total events", .{ epoll_per_sec, events_per_call, epoll_events_total });
+                log.info("epoll_wait: {any} calls/sec, {any} events/call, {d} total events", .{ epoll_per_sec, events_per_call, epoll_events_total });
                 self.logPeriodicStats(now_ns);
                 epoll_calls = 0;
                 epoll_events_total = 0;
