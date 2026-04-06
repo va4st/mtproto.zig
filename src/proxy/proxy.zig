@@ -3120,6 +3120,10 @@ const EventLoop = struct {
             .desync_wait => {
                 // Wait for timer tick only; keeping EPOLLOUT enabled here can
                 // cause a busy loop because writable sockets trigger continuously.
+                want_client_in = false;
+                want_client_out = false;
+                want_upstream_in = false;
+                want_upstream_out = false;
             },
 
             .connecting_upstream => {
@@ -3142,12 +3146,16 @@ const EventLoop = struct {
 
             .relaying => {
                 want_client_in = !slot.hasUpstreamPending();
+                want_client_out = false;
                 want_upstream_in = !slot.hasClientPending();
+                want_upstream_out = false;
             },
 
             .mask_relaying => {
                 want_client_in = !slot.hasUpstreamPending();
+                want_client_out = false;
                 want_upstream_in = !slot.hasClientPending();
+                want_upstream_out = false;
             },
 
             else => {},
