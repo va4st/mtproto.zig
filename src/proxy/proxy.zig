@@ -1512,7 +1512,19 @@ const EventLoop = struct {
 
         const has_drops = d_cap + d_sat + d_rate + d_hs + d_hst + d_mpf > 0;
 
-        log.info("conn stats: active={d}/{d} hs_inflight={d} accepted+={d} closed+={d} tracked_fds={d} total={d} paused={}/{}", .{
+        var phase_counts: [16]usize = [_]usize{0} ** 16;
+        for (self.pool.slots) |maybe_slot| {
+            if (maybe_slot) |slot| {
+                if (slot.phase != .idle) {
+                    const phase_num = @intFromEnum(slot.phase);
+                    if (phase_num < 16) {
+                        phase_counts[phase_num] += 1;
+                    }
+                }
+            }
+        }
+
+        log.info("conn stats: active={d}/{d} hs_inflight={d} accepted+={d} closed+={d} tracked_fds={d} total={d} accept_paused={} saturation_paused={}", .{
             active,
             self.state.config.max_connections,
             hs,
@@ -1528,6 +1540,10 @@ const EventLoop = struct {
             log.info("  drops: cap+={d} sat+={d} rate+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d}", .{
                 d_cap, d_sat, d_rate, d_hs, d_hst, d_mpf,
             });
+        }
+
+        if (phase_counts[12] > 0 or phase_counts[13] > 0) {
+            log.info("phases: relaying={d} mask_relaying={d}", .{ phase_counts[12], phase_counts[13] });
         }
 
         self.accepted_since_log = 0;
