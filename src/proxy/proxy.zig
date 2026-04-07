@@ -1728,7 +1728,8 @@ const EventLoop = struct {
     }
 
     fn readTlsHeader(self: *EventLoop, slot: *ConnectionSlot) void {
-        while (slot.tls_hdr_pos < tls_header_len) {
+        var spins: u32 = 0;
+        while (spins < relay_spin_cap and slot.tls_hdr_pos < tls_header_len) : (spins += 1) {
             const n = posix.read(slot.client_fd, slot.tls_hdr_buf[slot.tls_hdr_pos..]) catch |err| {
                 if (err == error.WouldBlock) return;
                 self.closeSlot(slot, "tls header read error");
@@ -1778,7 +1779,8 @@ const EventLoop = struct {
     fn readClientHelloBody(self: *EventLoop, slot: *ConnectionSlot) void {
         const hello_buf = slot.clientHelloBuf();
 
-        while (slot.tls_body_pos < slot.tls_body_len) {
+        var spins: u32 = 0;
+        while (spins < relay_spin_cap and slot.tls_body_pos < slot.tls_body_len) : (spins += 1) {
             const off = tls_header_len + slot.tls_body_pos;
             const end = tls_header_len + slot.tls_body_len;
             const n = posix.read(slot.client_fd, hello_buf[off..end]) catch |err| {
@@ -1889,7 +1891,9 @@ const EventLoop = struct {
 
     fn readMtprotoHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
         // Phase pair: read TLS header then body, reusing tls_* fields.
-        while (true) {
+        var packets_processed: u32 = 0;
+        while (packets_processed < relay_spin_cap) {
+            packets_processed += 1;
             if (slot.phase == .reading_mtproto_tls_header) {
                 while (slot.tls_hdr_pos < tls_header_len) {
                     const n = posix.read(slot.client_fd, slot.tls_hdr_buf[slot.tls_hdr_pos..]) catch |err| {
@@ -1937,6 +1941,7 @@ const EventLoop = struct {
                     self.finishClientHandshake(slot);
                     return;
                 }
+                // Continue with next packet within spin cap
                 continue;
             }
 
