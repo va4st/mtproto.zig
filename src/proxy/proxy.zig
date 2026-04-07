@@ -1317,6 +1317,27 @@ const EventLoop = struct {
                 if (epoll_calls % 100000 == 0) {
                     log.debug("epoll_wait instant return: {d} calls, {d}us, {d} events", .{ epoll_calls, epoll_took_us, n });
                 }
+                if (epoll_calls % 500000 == 0) {
+                    for (events[0..n]) |hot_ev| {
+                        const hot_fd = hot_ev.data.fd;
+                        const is_listen = hot_fd == self.listen_fd;
+                        if (!is_listen) {
+                            if (self.pool.getByFd(hot_fd)) |hot_slot| {
+                                const is_client = hot_fd == hot_slot.client_fd;
+                                log.debug("  hot fd={d} fd_role={s} phase={s} ev=0x{x} c_in={} c_out={} u_in={} u_out={}", .{
+                                    hot_fd,
+                                    if (is_client) "client" else "upstream",
+                                    @tagName(hot_slot.phase),
+                                    hot_ev.events,
+                                    hot_slot.client_interest_in,
+                                    hot_slot.client_interest_out,
+                                    hot_slot.upstream_interest_in,
+                                    hot_slot.upstream_interest_out,
+                                });
+                            }
+                        }
+                    }
+                }
             }
             for (events[0..n]) |ev| {
                 const fd = ev.data.fd;
@@ -3167,17 +3188,17 @@ const EventLoop = struct {
             },
 
             .relaying => {
-                want_client_in = !slot.hasUpstreamPending();
-                want_client_out = false;
-                want_upstream_in = !slot.hasClientPending();
-                want_upstream_out = false;
+                want_client_in = !slot.hasUpstreamPending() and !slot.hasClientPending();
+                want_client_out = slot.hasClientPending();
+                want_upstream_in = !slot.hasClientPending() and !slot.hasUpstreamPending();
+                want_upstream_out = slot.hasUpstreamPending();
             },
 
             .mask_relaying => {
-                want_client_in = !slot.hasUpstreamPending();
-                want_client_out = false;
-                want_upstream_in = !slot.hasClientPending();
-                want_upstream_out = false;
+                want_client_in = !slot.hasUpstreamPending() and !slot.hasClientPending();
+                want_client_out = slot.hasClientPending();
+                want_upstream_in = !slot.hasClientPending() and !slot.hasUpstreamPending();
+                want_upstream_out = slot.hasUpstreamPending();
             },
 
             else => {},
