@@ -3130,11 +3130,13 @@ const EventLoop = struct {
             .reading_mtproto_tls_body,
             => {
                 want_client_in = true;
+                want_client_out = false;
             },
 
             .writing_server_hello_first,
             .writing_server_hello_rest,
             => {
+                want_client_in = false;
                 want_client_out = true;
             },
 
