@@ -1542,9 +1542,9 @@ const EventLoop = struct {
             });
         }
 
-        if (phase_counts[12] > 0 or phase_counts[13] > 0) {
-            log.info("phases: relaying={d} mask_relaying={d}", .{ phase_counts[12], phase_counts[13] });
-        }
+        log.info("phases: relaying={d} mask_relaying={d} connecting={d} handshake={d}", .{
+            phase_counts[12], phase_counts[13], phase_counts[9], phase_counts[11],
+        });
 
         self.accepted_since_log = 0;
         self.closed_since_log = 0;
