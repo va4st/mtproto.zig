@@ -622,6 +622,7 @@ const ConnectionSlot = struct {
     traffic_client_to_upstream_counter: ?*std.atomic.Value(u64) = null,
     traffic_upstream_to_client_counter: ?*std.atomic.Value(u64) = null,
     user_metrics: ?*ProxyState.UserMetrics = null,
+    user_metrics_reserved: bool = false,
 
     // Non-blocking write queues (slab-like chain buffers)
     client_queue: MessageQueue = .{ .allocator = std.heap.page_allocator },
@@ -724,7 +725,6 @@ const ConnectionSlot = struct {
         self.current_upstream_addr = null;
         self.dc_abs = 0;
         self.is_media_path = false;
-        self.user_metrics = null;
 
         if (self.mp_frame_buf) |buf| allocator.free(buf);
         self.mp_frame_buf = null;
@@ -741,6 +741,23 @@ const ConnectionSlot = struct {
         self.client_decryptor = null;
         self.tg_encryptor = null;
         self.tg_decryptor = null;
+    }
+
+    fn reserveUserMetrics(self: *ConnectionSlot, entry: *ProxyState.UserMetrics) void {
+        std.debug.assert(!self.user_metrics_reserved);
+        self.user_metrics = entry;
+        self.user_metrics_reserved = true;
+        _ = entry.connections_active.fetchAdd(1, .monotonic);
+    }
+
+    fn releaseUserMetrics(self: *ConnectionSlot) void {
+        if (self.user_metrics_reserved) {
+            if (self.user_metrics) |entry| {
+                _ = entry.connections_active.fetchSub(1, .monotonic);
+            }
+            self.user_metrics_reserved = false;
+        }
+        self.user_metrics = null;
     }
 
     fn clientHelloBuf(self: *ConnectionSlot) []u8 {
@@ -1830,6 +1847,7 @@ const EventLoop = struct {
             slot.traffic_client_to_upstream_counter = &self.state.client_to_upstream_bytes_total;
             slot.traffic_upstream_to_client_counter = &self.state.upstream_to_client_bytes_total;
             slot.user_metrics = null;
+            slot.user_metrics_reserved = false;
             slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
@@ -2479,9 +2497,8 @@ const EventLoop = struct {
             return;
         }
 
-        slot.user_metrics = self.state.findUserMetrics(result.user);
-        if (slot.user_metrics) |entry| {
-            _ = entry.connections_active.fetchAdd(1, .monotonic);
+        if (self.state.findUserMetrics(result.user)) |entry| {
+            slot.reserveUserMetrics(entry);
         }
 
         slot.dc_abs = @intCast(dc_abs);
@@ -3897,15 +3914,9 @@ const EventLoop = struct {
             slot.upstream_fd = -1;
         }
 
-        const user_metrics = slot.user_metrics;
-        slot.resetOwnedBuffers(self.state.allocator);
-
         if (slot.active_reserved) {
             _ = self.state.active_connections.fetchSub(1, .monotonic);
             _ = self.state.closed_count.fetchAdd(1, .monotonic);
-            if (user_metrics) |entry| {
-                _ = entry.connections_active.fetchSub(1, .monotonic);
-            }
             // If connection was still in handshake phase, release from handshake budget
             if (slot.handshakeInProgress()) {
                 _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
@@ -3914,6 +3925,8 @@ const EventLoop = struct {
             self.closed_since_log += 1;
         }
 
+        slot.releaseUserMetrics();
+        slot.resetOwnedBuffers(self.state.allocator);
         slot.desync_wait_enqueued = false;
         slot.phase = .idle;
         self.pool.release(slot);
@@ -5241,4 +5254,23 @@ test "handshakeInProgress - phases" {
     try std.testing.expect(!slot.handshakeInProgress());
     slot.phase = .closing;
     try std.testing.expect(!slot.handshakeInProgress());
+}
+
+test "owned buffer reset preserves per-user active accounting" {
+    var metrics = ProxyState.UserMetrics{
+        .name = "alice",
+        .connections_active = std.atomic.Value(u32).init(0),
+        .client_to_upstream_bytes_total = std.atomic.Value(u64).init(0),
+        .upstream_to_client_bytes_total = std.atomic.Value(u64).init(0),
+    };
+    var slot: ConnectionSlot = .{};
+
+    slot.reserveUserMetrics(&metrics);
+    try std.testing.expectEqual(@as(u32, 1), metrics.connections_active.load(.monotonic));
+
+    slot.resetOwnedBuffers(std.testing.allocator);
+
+    try std.testing.expect(slot.user_metrics != null);
+    slot.releaseUserMetrics();
+    try std.testing.expectEqual(@as(u32, 0), metrics.connections_active.load(.monotonic));
 }
