@@ -40,6 +40,10 @@ const proxy_upstream_handshake = @import("proxy_upstream_handshake.zig");
 const middle_proxy_fallback = @import("middle_proxy_fallback.zig");
 const dc_nonce = @import("dc_nonce.zig");
 const upstream_failover = @import("upstream_failover.zig");
+const host_whitelist = @import("host_whitelist.zig");
+const resolver_mod = @import("resolver.zig");
+const ss_session_mod = @import("ss_session.zig");
+const SaltCache = @import("replay_cache.zig").SaltCache;
 const runtime_log = @import("../runtime_log.zig");
 
 test {
@@ -64,6 +68,9 @@ test {
     _ = @import("middle_proxy_fallback.zig");
     _ = @import("dc_nonce.zig");
     _ = @import("upstream_failover.zig");
+    _ = @import("host_whitelist.zig");
+    _ = @import("resolver.zig");
+    _ = @import("ss_session.zig");
 }
 
 const log = std.log.scoped(.proxy);
@@ -118,6 +125,9 @@ const UpstreamKind = enum {
     none,
     dc,
     mask,
+    /// Shadowsocks-2022 listener: upstream is the user-requested CONNECT
+    /// target, talked to in plaintext; AEAD framing happens client-side.
+    ss,
 };
 
 const MiddleProxyHandshakeStep = enum {
@@ -305,6 +315,10 @@ const ConnectionSlot = struct {
     upstream_interest_out: bool = false,
     desync_wait_enqueued: bool = false,
 
+    /// Shadowsocks session state — non-null for SS listener slots only.
+    /// Lazy heap-allocated so MTProto sessions pay no extra memory.
+    ss_session: ?*ss_session_mod.Session = null,
+
     fn hasClientPending(self: *const ConnectionSlot) bool {
         return !self.client_queue.isEmpty();
     }
@@ -333,6 +347,10 @@ const ConnectionSlot = struct {
             .proxy_http_connect_resp,
             .writing_dc_nonce,
             .middle_proxy_handshake,
+            .ss_reading_salt,
+            .ss_reading_fixed_header,
+            .ss_reading_var_header,
+            .ss_connecting_upstream,
             => true,
             else => false,
         };
@@ -386,6 +404,12 @@ const ConnectionSlot = struct {
         self.client_decryptor = null;
         self.tg_encryptor = null;
         self.tg_decryptor = null;
+
+        if (self.ss_session) |sess| {
+            sess.deinit();
+            allocator.destroy(sess);
+            self.ss_session = null;
+        }
     }
 
     fn clientHelloBuf(self: *ConnectionSlot) []u8 {
@@ -560,6 +584,24 @@ pub const ProxyState = struct {
     upstream: upstream_mod.Upstream,
     tunnel_info: tunnel_mod.Tunnel,
 
+    // ── Shadowsocks-2022 listener state ─────────────────────────
+    /// Per-process salt cache for SS-2022 anti-replay (60s window).
+    salt_cache: SaltCache,
+    /// Synchronous DNS resolver shared by all SS sessions.
+    ss_resolver: resolver_mod.Resolver,
+    /// Whitelist policy borrowing slices from `config.shadowsocks.allowed_hosts`.
+    ss_policy: host_whitelist.Policy,
+    /// SS-specific stats counters (monotonic totals).
+    stats_ss_accepted: std.atomic.Value(u64),
+    stats_ss_handshake_failed: std.atomic.Value(u64),
+    stats_ss_replay: std.atomic.Value(u64),
+    stats_ss_blocked_host: std.atomic.Value(u64),
+    stats_ss_blocked_private: std.atomic.Value(u64),
+    stats_ss_dns_failed: std.atomic.Value(u64),
+    stats_ss_relayed: std.atomic.Value(u64),
+    stats_ss_c2u_bytes: std.atomic.Value(u64),
+    stats_ss_u2c_bytes: std.atomic.Value(u64),
+
     pub fn init(allocator: std.mem.Allocator, cfg: Config, config_path: []const u8) !ProxyState {
         if (cfg.users.count() == 0) return error.NoUsersConfigured;
 
@@ -690,6 +732,21 @@ pub const ProxyState = struct {
             .middle_proxy_nat_ip4 = detected_nat_ip4,
             .middle_proxy_updater_shutdown = std.atomic.Value(bool).init(false),
             .middle_proxy_updater_thread = null,
+            .salt_cache = SaltCache.init(),
+            .ss_resolver = resolver_mod.Resolver.init(allocator),
+            .ss_policy = .{
+                .allowed_hosts = cfg.shadowsocks.allowed_hosts,
+                .block_private = cfg.shadowsocks.block_private_networks,
+            },
+            .stats_ss_accepted = std.atomic.Value(u64).init(0),
+            .stats_ss_handshake_failed = std.atomic.Value(u64).init(0),
+            .stats_ss_replay = std.atomic.Value(u64).init(0),
+            .stats_ss_blocked_host = std.atomic.Value(u64).init(0),
+            .stats_ss_blocked_private = std.atomic.Value(u64).init(0),
+            .stats_ss_dns_failed = std.atomic.Value(u64).init(0),
+            .stats_ss_relayed = std.atomic.Value(u64).init(0),
+            .stats_ss_c2u_bytes = std.atomic.Value(u64).init(0),
+            .stats_ss_u2c_bytes = std.atomic.Value(u64).init(0),
             .upstream = upblk: {
                 switch (cfg.upstream_mode) {
                     .tunnel => break :upblk upstream_mod.Upstream.initDirectWithMark(tunnel_socket_mark),
@@ -780,6 +837,7 @@ pub const ProxyState = struct {
             thread.join();
             self.middle_proxy_updater_thread = null;
         }
+        self.ss_resolver.deinit();
         self.allocator.free(self.config_path);
         self.allocator.free(self.user_secrets);
         self.allocator.free(self.user_metrics);
@@ -919,9 +977,61 @@ pub const ProxyState = struct {
             try @import("../monitoring.zig").start(self);
         }
 
-        var loop = try EventLoop.init(self, server.socket.handle, signal_controller.fd);
+        // Optional Shadowsocks-2022 listener.
+        var ss_server: ?net.Server = null;
+        defer if (ss_server) |*s| s.deinit(io_ctx);
+        var ss_listen_fd: posix.fd_t = -1;
+        if (self.config.shadowsocks.isUsable()) {
+            ss_server = self.openShadowsocksListener(io_ctx) catch |err| ssblk: {
+                log.err("Failed to open Shadowsocks listener on port {d}: {any} — SS disabled", .{
+                    self.config.shadowsocks.port,
+                    err,
+                });
+                break :ssblk null;
+            };
+            if (ss_server) |*s| {
+                setNonBlocking(s.socket.handle);
+                ss_listen_fd = s.socket.handle;
+                log.info("Shadowsocks-2022 listener bound on port {d} ({d} allowed host{s}, block_private={})", .{
+                    self.config.shadowsocks.port,
+                    self.config.shadowsocks.allowed_hosts.len,
+                    if (self.config.shadowsocks.allowed_hosts.len == 1) "" else "s",
+                    self.config.shadowsocks.block_private_networks,
+                });
+            }
+        } else if (self.config.shadowsocks.enabled) {
+            log.warn("[shadowsocks].enabled = true but configuration is incomplete; SS listener not started", .{});
+        }
+
+        var loop = try EventLoop.init(self, server.socket.handle, signal_controller.fd, ss_listen_fd);
         defer loop.deinit();
         try loop.run();
+    }
+
+    fn openShadowsocksListener(self: *ProxyState, io_ctx: std.Io) !net.Server {
+        const port = self.config.shadowsocks.port;
+        const backlog: u32 = 256;
+        if (self.config.shadowsocks.bind_address) |bind_str| {
+            const parsed = parseListenAddress(bind_str, port) orelse return error.InvalidShadowsocksBindAddress;
+            return try parsed.listen(io_ctx, .{
+                .reuse_address = true,
+                .kernel_backlog = @intCast(backlog),
+            });
+        }
+        const v6 = ip6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, port, 0, 0);
+        return v6.listen(io_ctx, .{
+            .reuse_address = true,
+            .kernel_backlog = @intCast(backlog),
+        }) catch |err| blk: {
+            if (err == error.AddressFamilyUnsupported) {
+                const v4 = ip4(.{ 0, 0, 0, 0 }, port);
+                break :blk try v4.listen(io_ctx, .{
+                    .reuse_address = true,
+                    .kernel_backlog = @intCast(backlog),
+                });
+            }
+            return err;
+        };
     }
 
     const MiddleProxySnapshot = middle_proxy_routing.MiddleProxySnapshot;
@@ -1187,6 +1297,9 @@ const EventLoop = struct {
     state: *ProxyState,
     epoll_fd: posix.fd_t,
     listen_fd: posix.fd_t,
+    /// Optional second listen socket for the Shadowsocks-2022 listener.
+    /// `-1` when the SS listener is disabled in the config.
+    ss_listen_fd: posix.fd_t = -1,
     signal_fd: posix.fd_t,
     pool: ConnectionPool,
     accept_paused: bool,
@@ -1211,7 +1324,7 @@ const EventLoop = struct {
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
 
-    fn init(state: *ProxyState, listen_fd: posix.fd_t, signal_fd: posix.fd_t) !EventLoop {
+    fn init(state: *ProxyState, listen_fd: posix.fd_t, signal_fd: posix.fd_t, ss_listen_fd: posix.fd_t) !EventLoop {
         const epoll_fd = try epollCreate();
         errdefer closeFd(epoll_fd);
 
@@ -1219,6 +1332,7 @@ const EventLoop = struct {
             .state = state,
             .epoll_fd = epoll_fd,
             .listen_fd = listen_fd,
+            .ss_listen_fd = ss_listen_fd,
             .signal_fd = signal_fd,
             .pool = try ConnectionPool.init(state.allocator, state.config.max_connections),
             .accept_paused = false,
@@ -1246,6 +1360,9 @@ const EventLoop = struct {
 
         try loop.addFd(listen_fd, true, false);
         try loop.addFd(signal_fd, true, false);
+        if (ss_listen_fd >= 0) {
+            try loop.addFd(ss_listen_fd, true, false);
+        }
         return loop;
     }
 
@@ -1303,6 +1420,14 @@ const EventLoop = struct {
                     }
                     continue;
                 }
+                if (self.ss_listen_fd >= 0 and fd == self.ss_listen_fd) {
+                    if (!self.shutting_down) {
+                        self.acceptShadowsocksConnections() catch |err| {
+                            log.err("ss accept loop error: {any}", .{err});
+                        };
+                    }
+                    continue;
+                }
 
                 const slot = self.pool.getByFd(fd) orelse continue;
                 self.processSlotEvent(slot, fd, ev_flags);
@@ -1349,7 +1474,9 @@ const EventLoop = struct {
                 self.onClientReadable(slot);
             }
         } else if (fd == slot.upstream_fd) {
-            if ((events & linux.EPOLL.OUT) != 0 or (slot.phase == .connecting_upstream and fatal_hangup)) {
+            if ((events & linux.EPOLL.OUT) != 0 or
+                ((slot.phase == .connecting_upstream or slot.phase == .ss_connecting_upstream) and fatal_hangup))
+            {
                 self.onUpstreamWritable(slot);
             }
             if (slot.phase == .idle) return;
@@ -1858,6 +1985,11 @@ const EventLoop = struct {
             .reading_mtproto_tls_header, .reading_mtproto_tls_body => self.readMtprotoHandshake(slot),
             .relaying => self.relayClientToUpstream(slot),
             .mask_relaying => self.relayRawClientToUpstream(slot),
+            .ss_reading_salt,
+            .ss_reading_fixed_header,
+            .ss_reading_var_header,
+            .ss_relaying,
+            => self.onSsClientReadable(slot),
             else => {},
         }
     }
@@ -1914,6 +2046,7 @@ const EventLoop = struct {
             .middle_proxy_handshake => self.middleProxyOnReadable(slot),
             .relaying => self.relayUpstreamToClient(slot),
             .mask_relaying => self.relayRawUpstreamToClient(slot),
+            .ss_relaying => self.onSsUpstreamReadable(slot),
             else => {},
         }
     }
@@ -1921,6 +2054,17 @@ const EventLoop = struct {
     fn onUpstreamWritable(self: *EventLoop, slot: *ConnectionSlot) void {
         switch (slot.phase) {
             .connecting_upstream => self.onUpstreamConnectComplete(slot),
+            .ss_connecting_upstream => self.onSsUpstreamConnectComplete(slot),
+            .ss_relaying => {
+                if (slot.hasUpstreamPending()) {
+                    if (flushUpstreamPending(slot, self.state.allocator)) |_| {} else |err| {
+                        log.debug("[{d}] ss upstream flush error: {any}", .{ slot.conn_id, err });
+                        self.closeSlot(slot, "ss upstream flush error");
+                        return;
+                    }
+                    if (!slot.hasUpstreamPending()) slot.last_activity_ms = nowMs();
+                }
+            },
             .proxy_socks5_greeting,
             .proxy_socks5_auth,
             .proxy_socks5_connect,
@@ -2832,6 +2976,23 @@ const EventLoop = struct {
                 want_upstream_in = !slot.hasClientPending();
             },
 
+            .ss_reading_salt,
+            .ss_reading_fixed_header,
+            .ss_reading_var_header,
+            => {
+                want_client_in = true;
+            },
+
+            .ss_connecting_upstream => {
+                want_client_in = false;
+                want_upstream_out = true;
+            },
+
+            .ss_relaying => {
+                want_client_in = !slot.hasUpstreamPending();
+                want_upstream_in = !slot.hasClientPending();
+            },
+
             else => {},
         }
 
@@ -2877,6 +3038,340 @@ const EventLoop = struct {
         const buf = try self.state.allocator.alloc(u8, self.state.config.middleProxyBufferBytes());
         self.mp_s2c_scratch = buf;
         return buf;
+    }
+
+    // ═════════════════════════════════════════════════════════
+    // Shadowsocks-2022 listener
+    // ═════════════════════════════════════════════════════════
+
+    fn acceptShadowsocksConnections(self: *EventLoop) !void {
+        const max = self.state.config.max_connections;
+        const active_now = self.state.active_connections.load(.monotonic);
+        if (active_now >= (max * 9) / 10) return;
+
+        var accepted_this_round: usize = 0;
+        while (accepted_this_round < accept_batch_limit) {
+            const accepted = acceptClient(self.ss_listen_fd) catch |err| {
+                switch (err) {
+                    error.ConnectionAborted, error.ConnectionResetByPeer => continue,
+                    error.ProcessFdQuotaExceeded,
+                    error.SystemFdQuotaExceeded,
+                    error.SystemResources,
+                    => {
+                        log.warn("ss accept: fd quota reached ({any})", .{err});
+                        return;
+                    },
+                    else => return error.UnexpectedAccept,
+                }
+            };
+            if (accepted == null) return;
+            const cfd = accepted.?.fd;
+            const client_addr = accepted.?.addr;
+            accepted_this_round += 1;
+
+            setTcpNoDelay(cfd);
+
+            if (!self.subnet_limiter.check(client_addr, self.state.config.rate_limit_per_subnet)) {
+                _ = self.state.stats_dropped_rate_limit.fetchAdd(1, .monotonic);
+                closeFd(cfd);
+                continue;
+            }
+
+            const active_before = self.state.active_connections.fetchAdd(1, .monotonic);
+            if (active_before >= self.state.config.max_connections) {
+                _ = self.state.active_connections.fetchSub(1, .monotonic);
+                _ = self.state.stats_dropped_cap.fetchAdd(1, .monotonic);
+                closeFd(cfd);
+                continue;
+            }
+
+            const hs_inflight = self.state.handshakes_inflight.fetchAdd(1, .monotonic);
+            const hs_max = (self.state.config.max_connections * 3) / 10;
+            if (hs_max > 0 and hs_inflight >= hs_max) {
+                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+                _ = self.state.active_connections.fetchSub(1, .monotonic);
+                _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
+                closeFd(cfd);
+                continue;
+            }
+
+            const slot = self.pool.acquire() orelse {
+                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+                _ = self.state.active_connections.fetchSub(1, .monotonic);
+                closeFd(cfd);
+                continue;
+            };
+
+            const psk_ptr: *const [32]u8 = &self.state.config.shadowsocks.psk.?;
+            const session = self.state.allocator.create(ss_session_mod.Session) catch {
+                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+                _ = self.state.active_connections.fetchSub(1, .monotonic);
+                closeFd(cfd);
+                self.pool.release(slot);
+                continue;
+            };
+            session.* = ss_session_mod.Session.init(self.state.allocator, psk_ptr);
+
+            slot.active_reserved = true;
+            slot.traffic_client_to_upstream_counter = &self.state.stats_ss_c2u_bytes;
+            slot.traffic_upstream_to_client_counter = &self.state.stats_ss_u2c_bytes;
+            slot.user_metrics = null;
+            slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
+            slot.client_fd = cfd;
+            slot.peer_addr = client_addr;
+            slot.phase = .ss_reading_salt;
+            slot.created_at_ms = nowMs();
+            slot.last_activity_ms = slot.created_at_ms;
+            slot.ss_session = session;
+
+            _ = self.state.stats_ss_accepted.fetchAdd(1, .monotonic);
+
+            if (self.addFd(cfd, true, false)) |_| {
+                self.pool.mapFd(cfd, slot.index) catch {
+                    self.closeSlot(slot, "ss fd map failed");
+                    continue;
+                };
+                self.accepted_since_log += 1;
+            } else |_| {
+                self.closeSlot(slot, "ss epoll add failed");
+                continue;
+            }
+        }
+    }
+
+    fn onSsClientReadable(self: *EventLoop, slot: *ConnectionSlot) void {
+        const session = slot.ss_session orelse {
+            self.closeSlot(slot, "ss missing session state");
+            return;
+        };
+
+        var loops: usize = 0;
+        while (true) : (loops += 1) {
+            // Bounded loop guard: extremely large pipelines on a single
+            // readable event shouldn't starve other connections.
+            if (loops > 64) return;
+
+            // Fill the ingress buffer up to the current chunk boundary.
+            while (session.in_have < session.in_need) {
+                const want = session.in_need - session.in_have;
+                const n = posix.read(slot.client_fd, session.in_buf[session.in_have .. session.in_have + want]) catch |err| {
+                    if (err == error.WouldBlock) return;
+                    self.closeSlot(slot, "ss client read error");
+                    return;
+                };
+                if (n == 0) {
+                    self.closeSlot(slot, "ss client eof");
+                    return;
+                }
+                session.in_have += @intCast(n);
+                slot.last_activity_ms = nowMs();
+            }
+
+            const ev = session.step(realtimeSeconds());
+            switch (ev) {
+                .need_more => continue,
+                .target_ready => {
+                    self.onSsTargetReady(slot) catch |err| {
+                        log.debug("[{d}] ss target failure: {any}", .{ slot.conn_id, err });
+                    };
+                    if (slot.phase == .idle) return;
+                    if (slot.phase != .ss_relaying) return;
+                    // Otherwise we transitioned straight into relay (rare:
+                    // synchronous connect succeeded) — keep draining ingress.
+                    continue;
+                },
+                .payload => |pt| {
+                    self.queueSsToUpstream(slot, pt) catch |err| {
+                        log.debug("[{d}] ss queue upstream failed: {any}", .{ slot.conn_id, err });
+                        self.closeSlot(slot, "ss queue upstream failed");
+                        return;
+                    };
+                    continue;
+                },
+                .error_close => |err| {
+                    _ = self.state.stats_ss_handshake_failed.fetchAdd(1, .monotonic);
+                    log.debug("[{d}] ss session error: {any}", .{ slot.conn_id, err });
+                    self.closeSlot(slot, "ss session error");
+                    return;
+                },
+            }
+        }
+    }
+
+    fn onSsTargetReady(self: *EventLoop, slot: *ConnectionSlot) !void {
+        const session = slot.ss_session.?;
+
+        // Salt-replay check (anti-DPI). Done now (after first chunk decrypts
+        // successfully) so an attacker can't cheaply pollute the cache by
+        // dialing the port and dropping random salts.
+        if (self.state.salt_cache.checkAndInsert(&session.request_salt)) {
+            _ = self.state.stats_ss_replay.fetchAdd(1, .monotonic);
+            self.closeSlot(slot, "ss salt replay");
+            return error.SaltReplay;
+        }
+
+        // Whitelist + private-network policy.
+        var target_scratch: [64]u8 = undefined;
+        const target_str = session.targetString(&target_scratch);
+        const decision = self.state.ss_policy.checkClientHost(target_str);
+        switch (decision) {
+            .allowed => {},
+            .not_in_whitelist => {
+                _ = self.state.stats_ss_blocked_host.fetchAdd(1, .monotonic);
+                log.info("[{d}] ss CONNECT denied (not in whitelist): {s}:{d}", .{ slot.conn_id, target_str, session.target_port });
+                self.closeSlot(slot, "ss host not whitelisted");
+                return error.HostNotWhitelisted;
+            },
+            .private_network => {
+                _ = self.state.stats_ss_blocked_private.fetchAdd(1, .monotonic);
+                log.info("[{d}] ss CONNECT denied (private network): {s}:{d}", .{ slot.conn_id, target_str, session.target_port });
+                self.closeSlot(slot, "ss private network");
+                return error.PrivateNetworkBlocked;
+            },
+            .invalid => {
+                self.closeSlot(slot, "ss invalid target");
+                return error.InvalidTarget;
+            },
+        }
+
+        // Resolve target to an Address (IP literal short-circuits resolver).
+        const addr: Address = if (session.target_ip_v4) |b|
+            .{ .ip4 = .{ .bytes = b, .port = session.target_port } }
+        else if (session.target_ip_v6) |b|
+            .{ .ip6 = .{ .bytes = b, .port = session.target_port, .flow = 0, .interface = .{ .index = 0 } } }
+        else blk: {
+            const resolved = self.state.ss_resolver.resolve(target_str, session.target_port) catch |err| {
+                _ = self.state.stats_ss_dns_failed.fetchAdd(1, .monotonic);
+                log.info("[{d}] ss DNS failed for {s}:{d}: {any}", .{ slot.conn_id, target_str, session.target_port, err });
+                self.closeSlot(slot, "ss dns failed");
+                return error.DnsFailed;
+            };
+            if (resolved.count == 0) {
+                self.closeSlot(slot, "ss dns empty");
+                return error.DnsEmpty;
+            }
+            // Re-check against private-network policy after resolution
+            // (defends against DNS rebinding when block_private_networks is on).
+            var picked: ?Address = null;
+            for (resolved.slice()) |candidate| {
+                if (self.state.ss_policy.checkResolvedAddress(candidate) == .allowed) {
+                    picked = candidate;
+                    break;
+                }
+            }
+            if (picked == null) {
+                _ = self.state.stats_ss_blocked_private.fetchAdd(1, .monotonic);
+                self.closeSlot(slot, "ss resolved address private");
+                return error.PrivateNetworkBlocked;
+            }
+            break :blk picked.?;
+        };
+
+        try self.startSsUpstreamConnect(slot, addr);
+    }
+
+    fn startSsUpstreamConnect(self: *EventLoop, slot: *ConnectionSlot, addr: Address) !void {
+        // Always bypass the configured MTProto upstream — SS targets
+        // are external HTTPS endpoints, not Telegram DCs.
+        const direct = upstream_mod.Upstream.initDirect();
+        const connect_result = try direct.connect(addr);
+        const fd = connect_result.fd;
+        errdefer closeFd(fd);
+
+        try self.addFd(fd, false, true);
+        errdefer _ = self.delFd(fd) catch {};
+
+        try self.pool.mapFd(fd, slot.index);
+        errdefer self.pool.unmapFd(fd);
+
+        slot.upstream_fd = fd;
+        slot.upstream_kind = .ss;
+        slot.current_upstream_addr = addr;
+        slot.phase = .ss_connecting_upstream;
+
+        if (!connect_result.pending) {
+            self.onSsUpstreamConnectComplete(slot);
+        }
+    }
+
+    fn onSsUpstreamConnectComplete(self: *EventLoop, slot: *ConnectionSlot) void {
+        if (checkSocketConnectError(slot.upstream_fd)) |_| {} else |err| {
+            log.debug("[{d}] ss upstream connect failed: {any}", .{ slot.conn_id, err });
+            self.closeSlot(slot, "ss upstream connect failed");
+            return;
+        }
+
+        configureRelaySocket(slot.client_fd);
+        configureRelaySocket(slot.upstream_fd);
+
+        const session = slot.ss_session.?;
+        session.markUpstreamConnected();
+        slot.phase = .ss_relaying;
+        // SS handshake complete — release from the handshake budget.
+        _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+        _ = self.state.stats_ss_relayed.fetchAdd(1, .monotonic);
+
+        // Drain any inline initial payload that arrived with the variable
+        // header (clients sometimes send the entire HTTP request inline).
+        if (session.takeInitialPayload()) |payload| {
+            defer self.state.allocator.free(payload);
+            if (queueUpstream(slot, self.state.allocator, payload)) |_| {} else |err| {
+                log.debug("[{d}] ss initial payload queue failed: {any}", .{ slot.conn_id, err });
+                self.closeSlot(slot, "ss initial payload queue failed");
+                return;
+            }
+        }
+    }
+
+    fn queueSsToUpstream(self: *EventLoop, slot: *ConnectionSlot, plaintext: []const u8) !void {
+        if (plaintext.len == 0) return;
+        try queueUpstream(slot, self.state.allocator, plaintext);
+        if (slot.traffic_client_to_upstream_counter) |c| {
+            _ = c.fetchAdd(plaintext.len, .monotonic);
+        }
+    }
+
+    fn onSsUpstreamReadable(self: *EventLoop, slot: *ConnectionSlot) void {
+        const session = slot.ss_session orelse return;
+        if (!session.isRelaying()) return;
+
+        var read_buf: [ss_session_mod.max_data_chunk]u8 = undefined;
+        // Bounded loop: drain a few syscalls per readable event so other
+        // connections still get a chance.
+        var loops: usize = 0;
+        while (loops < 8) : (loops += 1) {
+            const n = posix.read(slot.upstream_fd, &read_buf) catch |err| {
+                if (err == error.WouldBlock) return;
+                self.closeSlot(slot, "ss upstream read error");
+                return;
+            };
+            if (n == 0) {
+                self.closeSlot(slot, "ss upstream eof");
+                return;
+            }
+            slot.last_activity_ms = nowMs();
+
+            // Wrap into one or more SS chunks (each chunk <= max_data_chunk).
+            var off: usize = 0;
+            while (off < n) {
+                const take = @min(n - off, ss_session_mod.max_data_chunk);
+                var out_buf: [ss_session_mod.max_data_chunk + 256]u8 = undefined;
+                const wrote = session.wrapForClient(&out_buf, read_buf[off .. off + take], realtimeSeconds()) catch |err| {
+                    log.debug("[{d}] ss wrap failed: {any}", .{ slot.conn_id, err });
+                    self.closeSlot(slot, "ss wrap failed");
+                    return;
+                };
+                queueClient(slot, self.state.allocator, wrote) catch |err| {
+                    log.debug("[{d}] ss queue client failed: {any}", .{ slot.conn_id, err });
+                    self.closeSlot(slot, "ss queue client failed");
+                    return;
+                };
+                if (slot.traffic_upstream_to_client_counter) |c| {
+                    _ = c.fetchAdd(take, .monotonic);
+                }
+                off += take;
+            }
+        }
     }
 
     fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {

@@ -478,6 +478,7 @@ test {
     _ = config;
     _ = proxy;
     _ = @import("tunnel.zig");
+    _ = @import("protocol/shadowsocks.zig");
 }
 
 test "capacity safety clamp enforces safe cap when override disabled" {

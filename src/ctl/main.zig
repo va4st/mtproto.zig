@@ -27,6 +27,7 @@ const version_mod = @import("version");
 const uninstall = @import("uninstall.zig");
 const config_cmd = @import("config_cmd.zig");
 const links = @import("links.zig");
+const ss_cmd = @import("ss.zig");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -147,6 +148,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "reload")) {
             reloadProxy(&ui, allocator);
             return;
+        } else if (std.mem.eql(u8, cmd, "ss")) {
+            return ss_cmd.run(&ui, allocator, &remaining_args);
         } else {
             ui.print("\n  {s}{s}:{s} {s}\n\n", .{
                 Color.err,

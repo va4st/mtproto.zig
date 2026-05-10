@@ -179,6 +179,11 @@ sudo mtbuddy links --server proxy.example.com --config /opt/mtproto-proxy/config
 # Generate a fresh 32-hex user secret
 mtbuddy secret
 
+# Enable Shadowsocks-2022 listener for Telegram mini-apps (iOS WebView)
+sudo mtbuddy ss enable
+sudo mtbuddy ss link            # print SS URL / sing-box snippet
+sudo mtbuddy ss disable         # turn the listener off (PSK preserved)
+
 # Hot-reload config (SIGHUP, reloadable settings only)
 sudo mtbuddy reload
 
@@ -388,12 +393,118 @@ alice = true   # bypass MiddleProxy for this user
 | `[censorship] fast_mode` | `false` | Delegate S2C encryption to DC (recommended) |
 | `[access.users] <name>` | — | 32 hex-char secret per user |
 | `[access.direct_users] <name>` | — | Bypass ME for this user |
+| `[shadowsocks] enabled` | `false` | Enable the Shadowsocks-2022 listener for Telegram mini-apps |
+| `[shadowsocks] port` | `8388` | TCP listen port (must differ from `[server].port`) |
+| `[shadowsocks] bind_address` | — | Bind address for the SS listener (default: all interfaces) |
+| `[shadowsocks] psk` | — | 32-byte PSK in base64 — required when `enabled = true` |
+| `[shadowsocks] allowed_hosts` | — | Comma-separated DNS suffix allow-list for CONNECT targets |
+| `[shadowsocks] block_private_networks` | `true` | Refuse CONNECT to RFC1918 / link-local / loopback / ULA / multicast |
+| `[shadowsocks] handshake_timeout_sec` | `15` | SS session handshake timeout |
 
 </details>
 
 > Generate a secret: `mtbuddy secret` or `openssl rand -hex 16`
 >
 > Print client links explicitly: `sudo mtbuddy links`. Runtime proxy logs intentionally hide secrets and proxy links.
+
+---
+
+## Telegram mini-apps (Shadowsocks-2022 listener)
+
+Telegram mini-apps on iOS open inside a system WebView that does **not** route through the MTProto proxy you configure in the app — it makes plaintext HTTPS requests via the system network stack. On a censored network those requests are still subject to DPI / SNI blocking even though regular chats are routed through the proxy without trouble.
+
+To unblock them, `mtproto.zig` ships a built-in **Shadowsocks-2022** (`2022-blake3-aes-256-gcm`, AEAD with replay protection per SIP022) listener on a separate port. Pair it with any iOS SS client (Shadowrocket, Stash, Loon, sing-box) configured to route only the WebView / mini-app traffic.
+
+### Why Shadowsocks 2022 (and not just plain SOCKS5 / VPN)
+
+* **DPI-resistant.** AEAD framing with per-session salts makes the wire indistinguishable from random TLS-like traffic; classical SS detection signatures don't match.
+* **No double-tunnel overhead.** Unlike a full VPN, only mini-app traffic crosses the proxy — the rest of the device stays on the regular network.
+* **Reuses the existing `mtproto-proxy` process.** Same `epoll` event loop, same connection budget, same metrics endpoint. No extra binary to manage.
+* **Strict allow-list on the server side.** Out-of-the-box config restricts CONNECT to a small list of Telegram mini-app hostnames (`telegram.org`, `t.me`, `fragment.com`, `wallet.tg`, `ton.org`, …) and refuses RFC1918 / link-local destinations to prevent abuse.
+
+### One-shot setup
+
+```bash
+sudo mtbuddy ss enable             # generates a PSK, writes [shadowsocks] to config.toml
+sudo ufw allow 8388/tcp            # open the SS port
+sudo mtbuddy reload                # SIGHUP picks up the new section without dropping clients
+```
+
+`mtbuddy ss enable` prints both a Shadowsocks URL and a sing-box outbound JSON snippet. Plug either into your iOS client.
+
+### Manual configuration
+
+Add a `[shadowsocks]` section to `/opt/mtproto-proxy/config.toml`:
+
+```toml
+[shadowsocks]
+enabled = true
+port = 8388                        # MUST differ from [server].port
+psk = "<base64-encoded 32-byte key>"   # mtbuddy ss psk to generate
+allowed_hosts = "telegram.org,t.me,fragment.com,wallet.tg,ton.org,tonkeeper.com"
+block_private_networks = true      # refuse CONNECT to RFC1918 / loopback / ULA / multicast
+handshake_timeout_sec = 15
+```
+
+Hostnames in `allowed_hosts` use **DNS suffix matching on label boundaries**: `telegram.org` matches `cdn.telegram.org` but **not** `eviltelegram.org`. The match is case-insensitive.
+
+### Client snippets
+
+**Shadowrocket / Stash / Loon URL** (printed by `mtbuddy ss link`):
+
+```
+ss://2022-blake3-aes-256-gcm:<base64-psk>@your.server.tld:8388#mtproto-ss
+```
+
+**sing-box outbound** (drop into `outbounds[]`):
+
+```jsonc
+{
+  "type": "shadowsocks",
+  "tag": "ss-mtproto",
+  "server": "your.server.tld",
+  "server_port": 8388,
+  "method": "2022-blake3-aes-256-gcm",
+  "password": "<base64-psk>"
+}
+```
+
+### Local smoke-test with sing-box
+
+When iterating on the listener, pair it with a local sing-box client (Linux):
+
+```bash
+# 1. Start the proxy with [shadowsocks] enabled
+sudo systemctl restart mtproto-proxy
+
+# 2. Run sing-box pointing at the listener
+sing-box run -c sing-box-mtproto-ss.json   # see snippet above + an HTTP inbound
+
+# 3. Verify mini-app traffic flows
+curl -x http://127.0.0.1:1080 https://t.me/some-mini-app
+```
+
+The proxy exposes the following Prometheus metrics under `/metrics` (when `[metrics].enabled = true`):
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `mtproto_ss_enabled` | gauge | `1` when listener is up and configured |
+| `mtproto_ss_connections_accepted_total` | counter | Total accepts on the SS listener |
+| `mtproto_ss_handshake_failed_total` | counter | Sessions that failed AEAD handshake |
+| `mtproto_ss_replay_total` | counter | Sessions rejected by salt anti-replay |
+| `mtproto_ss_blocked_host_total` | counter | CONNECTs rejected by allow-list |
+| `mtproto_ss_blocked_private_total` | counter | CONNECTs rejected because target is a private network |
+| `mtproto_ss_dns_failed_total` | counter | DNS resolution failures for the CONNECT target |
+| `mtproto_ss_relayed_total` | counter | Sessions that reached the relay phase |
+| `mtproto_ss_client_to_upstream_bytes_total` | counter | Plaintext bytes forwarded toward the target |
+| `mtproto_ss_upstream_to_client_bytes_total` | counter | Plaintext bytes forwarded back to the client (pre-AEAD) |
+
+### Operational notes
+
+* **Use a dedicated PSK per server.** PSKs are 32 random bytes; generate fresh ones with `mtbuddy ss psk`.
+* **Don't disable `block_private_networks`** unless you really need to proxy LAN destinations from a trusted network. With it on, even a leaked PSK can't be used as an SSRF gateway.
+* **The handshake budget is shared with the MTProto listener** (30% of `max_connections`). Massive SS handshake floods will pause new accepts on both ports.
+* The listener resolves CONNECT targets via a small TTL'd LRU cache (`positive_ttl_seconds = 300`, `negative_ttl_seconds = 30`). The lookup itself is synchronous, so a cold popular hostname briefly stalls the event loop — acceptable for a listener that handles a few mini-app sessions per device.
 
 ---
 

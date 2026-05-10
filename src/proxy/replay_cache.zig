@@ -9,81 +9,106 @@ fn nowSeconds() i64 {
     return @intCast(ts.sec);
 }
 
-pub const ReplayCache = struct {
-    const BUCKETS = 8192;
-    const MAX_PROBES = 8;
-    const stale_after_s: i64 = 60 * 60;
+/// Generic open-addressed replay-cache parameterised by entry TTL (seconds).
+/// Lookup key is a u64 derived from the first 8 bytes of the input digest.
+/// Zero heap allocations: fixed-size table + power-of-two probing.
+pub fn ReplayCacheGeneric(comptime stale_after_s: i64) type {
+    return struct {
+        const Self = @This();
+        const BUCKETS = 8192;
+        const MAX_PROBES = 8;
 
-    const Entry = struct {
-        used: bool = false,
-        key: u64 = 0,
-        last_seen_s: i64 = 0,
-    };
-
-    hash_seed: u64 = 0,
-    entries: [BUCKETS]Entry = [_]Entry{.{}} ** BUCKETS,
-
-    pub fn init() ReplayCache {
-        return .{
-            .hash_seed = crypto.randomInt(u64),
+        const Entry = struct {
+            used: bool = false,
+            key: u64 = 0,
+            last_seen_s: i64 = 0,
         };
-    }
 
-    fn digestKey(digest: *const [32]u8) u64 {
-        return std.mem.readInt(u64, digest[0..8], .little);
-    }
+        hash_seed: u64 = 0,
+        entries: [BUCKETS]Entry = [_]Entry{.{}} ** BUCKETS,
 
-    fn indexFor(self: *const ReplayCache, key: u64) usize {
-        var x = self.hash_seed ^ key;
-        x +%= 0x9E3779B97F4A7C15;
-        x ^= x >> 30;
-        x *%= 0xBF58476D1CE4E5B9;
-        x ^= x >> 27;
-        x *%= 0x94D049BB133111EB;
-        x ^= x >> 31;
-        return @as(usize, @intCast(x & (BUCKETS - 1)));
-    }
-
-    /// Returns true if this digest was already seen (duplicate replay),
-    /// false when inserted as a new digest.
-    pub fn checkAndInsert(self: *ReplayCache, digest: *const [32]u8) bool {
-        const key = digestKey(digest);
-        const now_s = nowSeconds();
-        const start = self.indexFor(key);
-
-        var first_stale_idx: ?usize = null;
-        var oldest_idx: usize = start;
-        var oldest_ts: i64 = std.math.maxInt(i64);
-
-        var probe: usize = 0;
-        while (probe < MAX_PROBES) : (probe += 1) {
-            const idx = (start + probe) & (BUCKETS - 1);
-            const e = &self.entries[idx];
-
-            if (!e.used) {
-                e.* = .{ .used = true, .key = key, .last_seen_s = now_s };
-                return false;
-            }
-
-            if (e.key == key) {
-                e.last_seen_s = now_s;
-                return true;
-            }
-
-            if (now_s - e.last_seen_s > stale_after_s and first_stale_idx == null) {
-                first_stale_idx = idx;
-            }
-            if (e.last_seen_s < oldest_ts) {
-                oldest_ts = e.last_seen_s;
-                oldest_idx = idx;
-            }
+        pub fn init() Self {
+            return .{
+                .hash_seed = crypto.randomInt(u64),
+            };
         }
 
-        const victim_idx = first_stale_idx orelse oldest_idx;
-        self.entries[victim_idx] = .{ .used = true, .key = key, .last_seen_s = now_s };
-        return false;
-    }
-};
+        fn digestKey(digest: []const u8) u64 {
+            std.debug.assert(digest.len >= 8);
+            return std.mem.readInt(u64, digest[0..8], .little);
+        }
+
+        fn indexFor(self: *const Self, key: u64) usize {
+            var x = self.hash_seed ^ key;
+            x +%= 0x9E3779B97F4A7C15;
+            x ^= x >> 30;
+            x *%= 0xBF58476D1CE4E5B9;
+            x ^= x >> 27;
+            x *%= 0x94D049BB133111EB;
+            x ^= x >> 31;
+            return @as(usize, @intCast(x & (BUCKETS - 1)));
+        }
+
+        /// Returns true if this digest was already seen (duplicate replay),
+        /// false when inserted as a new digest. Accepts any digest length >= 8;
+        /// only the first 8 bytes form the key.
+        pub fn checkAndInsert(self: *Self, digest: []const u8) bool {
+            const key = digestKey(digest);
+            const now_s = nowSeconds();
+            const start = self.indexFor(key);
+
+            var first_stale_idx: ?usize = null;
+            var oldest_idx: usize = start;
+            var oldest_ts: i64 = std.math.maxInt(i64);
+
+            var probe: usize = 0;
+            while (probe < MAX_PROBES) : (probe += 1) {
+                const idx = (start + probe) & (BUCKETS - 1);
+                const e = &self.entries[idx];
+
+                if (!e.used) {
+                    e.* = .{ .used = true, .key = key, .last_seen_s = now_s };
+                    return false;
+                }
+
+                if (e.key == key) {
+                    if (now_s - e.last_seen_s > stale_after_s) {
+                        // The entry has aged out: refresh and treat as new.
+                        e.last_seen_s = now_s;
+                        return false;
+                    }
+                    e.last_seen_s = now_s;
+                    return true;
+                }
+
+                if (now_s - e.last_seen_s > stale_after_s and first_stale_idx == null) {
+                    first_stale_idx = idx;
+                }
+                if (e.last_seen_s < oldest_ts) {
+                    oldest_ts = e.last_seen_s;
+                    oldest_idx = idx;
+                }
+            }
+
+            const victim_idx = first_stale_idx orelse oldest_idx;
+            self.entries[victim_idx] = .{ .used = true, .key = key, .last_seen_s = now_s };
+            return false;
+        }
+    };
+}
+
+/// MTProto fake-TLS replay cache. Stale window: 1 hour.
+pub const ReplayCache = ReplayCacheGeneric(60 * 60);
+
+/// Shadowsocks-2022 salt cache. Stale window: 60 seconds — twice the
+/// configured ±30s timestamp skew, which mirrors SIP022's recommendation.
+pub const SaltCache = ReplayCacheGeneric(60);
+
+// ─── Backwards-compatible API for ReplayCache ────────────────
+//
+// The MTProto path used to call `checkAndInsert(*const [32]u8)` with a fixed
+// 32-byte slice. The generic now takes `[]const u8`, which is a strict
+// superset, so existing call sites keep working without any changes.
 
 test "replay cache detects duplicate digest" {
     var cache = ReplayCache.init();
@@ -125,4 +150,34 @@ test "replay cache - property fuzz and replay invariants" {
             try std.testing.expect(cache.checkAndInsert(&digest));
         }
     }
+}
+
+test "salt cache: detects duplicate ss-2022 salt (32 bytes)" {
+    var cache = SaltCache.init();
+    const salt = [_]u8{0x77} ** 32;
+    try std.testing.expect(!cache.checkAndInsert(&salt));
+    try std.testing.expect(cache.checkAndInsert(&salt));
+}
+
+test "salt cache: distinct salts are accepted" {
+    var cache = SaltCache.init();
+    var s1 = [_]u8{0x11} ** 32;
+    var s2 = [_]u8{0x22} ** 32;
+    s1[0] = 1;
+    s2[0] = 2;
+    try std.testing.expect(!cache.checkAndInsert(&s1));
+    try std.testing.expect(!cache.checkAndInsert(&s2));
+}
+
+test "salt cache: accepts shorter slices (only first 8 bytes are keyed)" {
+    var cache = SaltCache.init();
+    // Two different 32-byte salts that share the first 8 bytes are
+    // intentionally treated as the same — that's the design (cheap key,
+    // collision risk is tiny over the 60s window).
+    var a = [_]u8{0xAA} ** 32;
+    var b = [_]u8{0xAA} ** 32;
+    @memset(a[8..], 0x01);
+    @memset(b[8..], 0x02);
+    try std.testing.expect(!cache.checkAndInsert(&a));
+    try std.testing.expect(cache.checkAndInsert(&b));
 }

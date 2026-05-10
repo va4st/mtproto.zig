@@ -4,6 +4,7 @@
 //! Format is compatible with the Rust telemt config.toml.
 
 const std = @import("std");
+const shadowsocks = @import("protocol/shadowsocks.zig");
 const net = std.Io.net;
 const default_tls_domain = "google.com";
 
@@ -75,6 +76,35 @@ pub const Config = struct {
         /// Return bound host, falling back to localhost.
         pub fn effectiveHost(self: *const Metrics) []const u8 {
             return self.host orelse "127.0.0.1";
+        }
+    };
+
+    /// Standalone Shadowsocks-2022 listener used for proxying iOS WebView
+    /// (Telegram mini-apps) and other non-MTProto HTTPS traffic that would
+    /// otherwise bypass the MTProto proxy and hit DPI-blocked SNIs directly.
+    pub const Shadowsocks = struct {
+        enabled: bool = false,
+        port: u16 = 8388,
+        /// Listen address. When null the SS listener inherits the same default
+        /// behaviour as the MTProto listener (dual-stack [::] with IPv4 fallback).
+        bind_address: ?[]const u8 = null,
+        /// 32-byte pre-shared key. Decoded from the base64 form in config.toml.
+        psk: ?[32]u8 = null,
+        /// Suffix-match list of allowed CONNECT targets. An empty list means
+        /// no CONNECT is allowed (effectively disables the listener even when
+        /// `enabled = true`). Each entry matches the target hostname as a DNS
+        /// suffix on a label boundary (`telegram.org` matches `cdn.telegram.org`
+        /// but NOT `eviltelegram.org`).
+        allowed_hosts: []const []const u8 = &.{},
+        /// Refuse CONNECT to RFC1918 / link-local / loopback / ULA / multicast.
+        /// On by default — required for safety when the PSK leaks.
+        block_private_networks: bool = true,
+        /// Per-session handshake timeout (seconds).
+        handshake_timeout_sec: u32 = 15,
+
+        /// True when the listener has the minimum configuration to start.
+        pub fn isUsable(self: *const Shadowsocks) bool {
+            return self.enabled and self.psk != null;
         }
     };
 
@@ -160,6 +190,7 @@ pub const Config = struct {
     /// Parsed from [upstream.tunnel].interface.
     upstream_tunnel_interface: ?[]const u8 = null,
     metrics: Metrics = .{},
+    shadowsocks: Shadowsocks = .{},
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
@@ -222,6 +253,28 @@ pub const Config = struct {
                 }
             }
         }
+
+        if (self.shadowsocks.enabled) {
+            const log = std.log.scoped(.config);
+            if (self.shadowsocks.psk == null) {
+                log.warn(
+                    "[shadowsocks].enabled = true but no psk configured; SS listener will not start",
+                    .{},
+                );
+            }
+            if (self.shadowsocks.allowed_hosts.len == 0) {
+                log.warn(
+                    "[shadowsocks] allowed_hosts is empty; the listener will reject every CONNECT. Set allowed_hosts = \"telegram.org,t.me,fragment.com,...\"",
+                    .{},
+                );
+            }
+            if (self.shadowsocks.port == self.port) {
+                log.err(
+                    "[shadowsocks].port ({d}) collides with [server].port; choose a different port",
+                    .{self.shadowsocks.port},
+                );
+            }
+        }
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
@@ -254,6 +307,7 @@ pub const Config = struct {
         var in_upstream_socks5_section = false;
         var in_upstream_http_section = false;
         var in_upstream_tunnel_section = false;
+        var in_shadowsocks_section = false;
         var server_tag_set = false;
 
         while (lines.next()) |raw_line| {
@@ -274,6 +328,7 @@ pub const Config = struct {
                 in_upstream_socks5_section = std.mem.eql(u8, line, "[upstream.socks5]");
                 in_upstream_http_section = std.mem.eql(u8, line, "[upstream.http]");
                 in_upstream_tunnel_section = std.mem.eql(u8, line, "[upstream.tunnel]");
+                in_shadowsocks_section = std.mem.eql(u8, line, "[shadowsocks]");
                 // Sub-sections are also part of the upstream family;
                 // entering a sub-section should not reset the parent.
                 if (in_upstream_socks5_section or in_upstream_http_section or in_upstream_tunnel_section) {
@@ -425,11 +480,60 @@ pub const Config = struct {
                     if (std.mem.eql(u8, key, "interface")) {
                         cfg.upstream_tunnel_interface = try allocator.dupe(u8, value);
                     }
+                } else if (in_shadowsocks_section) {
+                    if (std.mem.eql(u8, key, "enabled")) {
+                        cfg.shadowsocks.enabled = std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1");
+                    } else if (std.mem.eql(u8, key, "port")) {
+                        cfg.shadowsocks.port = std.fmt.parseInt(u16, value, 10) catch cfg.shadowsocks.port;
+                    } else if (std.mem.eql(u8, key, "bind_address")) {
+                        if (cfg.shadowsocks.bind_address) |b| allocator.free(b);
+                        cfg.shadowsocks.bind_address = try allocator.dupe(u8, value);
+                    } else if (std.mem.eql(u8, key, "psk")) {
+                        cfg.shadowsocks.psk = shadowsocks.decodePskBase64(value) catch |err| switch (err) {
+                            error.WrongPskLength => return error.ShadowsocksPskWrongLength,
+                            error.InvalidBase64 => return error.ShadowsocksPskInvalidBase64,
+                        };
+                    } else if (std.mem.eql(u8, key, "allowed_hosts")) {
+                        if (cfg.shadowsocks.allowed_hosts.len > 0) {
+                            for (cfg.shadowsocks.allowed_hosts) |h| allocator.free(h);
+                            allocator.free(cfg.shadowsocks.allowed_hosts);
+                            cfg.shadowsocks.allowed_hosts = &.{};
+                        }
+                        cfg.shadowsocks.allowed_hosts = try parseAllowedHosts(allocator, value);
+                    } else if (std.mem.eql(u8, key, "block_private_networks")) {
+                        cfg.shadowsocks.block_private_networks = std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1");
+                    } else if (std.mem.eql(u8, key, "handshake_timeout_sec")) {
+                        const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.shadowsocks.handshake_timeout_sec;
+                        cfg.shadowsocks.handshake_timeout_sec = @max(@as(u32, 5), parsed);
+                    }
                 }
             }
         }
 
         return cfg;
+    }
+
+    /// Parse a comma-separated list of hostname suffixes, lowercasing each
+    /// entry. Returns an owned slice of owned strings; caller frees via
+    /// `Config.deinit`.
+    fn parseAllowedHosts(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (list.items) |item| allocator.free(item);
+            list.deinit(allocator);
+        }
+
+        var it = std.mem.splitScalar(u8, value, ',');
+        while (it.next()) |raw| {
+            const trimmed = std.mem.trim(u8, raw, &[_]u8{ ' ', '\t' });
+            if (trimmed.len == 0) continue;
+            const lower = try allocator.alloc(u8, trimmed.len);
+            errdefer allocator.free(lower);
+            _ = std.ascii.lowerString(lower, trimmed);
+            try list.append(allocator, lower);
+        }
+
+        return list.toOwnedSlice(allocator);
     }
 
     pub fn deinit(self: *const Config, allocator: std.mem.Allocator) void {
@@ -474,6 +578,14 @@ pub const Config = struct {
         }
         if (self.metrics.host) |h| {
             allocator.free(h);
+        }
+
+        if (self.shadowsocks.bind_address) |b| {
+            allocator.free(b);
+        }
+        if (self.shadowsocks.allowed_hosts.len > 0) {
+            for (self.shadowsocks.allowed_hosts) |h| allocator.free(h);
+            allocator.free(self.shadowsocks.allowed_hosts);
         }
     }
 
@@ -1337,4 +1449,123 @@ test "parse config - fuzz malformed/random content" {
         var parsed = Config.parse(std.testing.allocator, buf[0..len]) catch continue;
         parsed.deinit(std.testing.allocator);
     }
+}
+
+test "parse config - shadowsocks defaults" {
+    const content =
+        \\[server]
+        \\port = 443
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(!cfg.shadowsocks.enabled);
+    try std.testing.expect(cfg.shadowsocks.psk == null);
+    try std.testing.expect(!cfg.shadowsocks.isUsable());
+    try std.testing.expectEqual(@as(u16, 8388), cfg.shadowsocks.port);
+    try std.testing.expect(cfg.shadowsocks.block_private_networks);
+}
+
+test "parse config - shadowsocks full" {
+    // Generate a valid base64 PSK (32 bytes -> 44 base64 chars).
+    const psk_bytes = [_]u8{0x42} ** 32;
+    var psk_b64_buf: [64]u8 = undefined;
+    const enc = std.base64.standard.Encoder;
+    const psk_b64 = enc.encode(psk_b64_buf[0..enc.calcSize(psk_bytes.len)], &psk_bytes);
+
+    var content_buf: [1024]u8 = undefined;
+    const content = try std.fmt.bufPrint(&content_buf,
+        \\[shadowsocks]
+        \\enabled = true
+        \\port = 8389
+        \\psk = "{s}"
+        \\allowed_hosts = "telegram.org, t.me, FRAGMENT.com"
+        \\block_private_networks = false
+        \\handshake_timeout_sec = 30
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    , .{psk_b64});
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.shadowsocks.enabled);
+    try std.testing.expectEqual(@as(u16, 8389), cfg.shadowsocks.port);
+    try std.testing.expect(cfg.shadowsocks.psk != null);
+    try std.testing.expectEqualSlices(u8, &psk_bytes, &cfg.shadowsocks.psk.?);
+    try std.testing.expect(!cfg.shadowsocks.block_private_networks);
+    try std.testing.expectEqual(@as(u32, 30), cfg.shadowsocks.handshake_timeout_sec);
+
+    try std.testing.expectEqual(@as(usize, 3), cfg.shadowsocks.allowed_hosts.len);
+    try std.testing.expectEqualStrings("telegram.org", cfg.shadowsocks.allowed_hosts[0]);
+    try std.testing.expectEqualStrings("t.me", cfg.shadowsocks.allowed_hosts[1]);
+    // Lowercased on parse.
+    try std.testing.expectEqualStrings("fragment.com", cfg.shadowsocks.allowed_hosts[2]);
+
+    try std.testing.expect(cfg.shadowsocks.isUsable());
+}
+
+test "parse config - shadowsocks invalid psk rejected" {
+    const content =
+        \\[shadowsocks]
+        \\enabled = true
+        \\psk = "not-base64!!!"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    try std.testing.expectError(
+        error.ShadowsocksPskInvalidBase64,
+        Config.parse(std.testing.allocator, content),
+    );
+}
+
+test "parse config - shadowsocks wrong-length psk rejected" {
+    // 16-byte (wrong) buffer -> base64 -> placed in config.
+    const bad = [_]u8{0x99} ** 16;
+    var b64_buf: [64]u8 = undefined;
+    const enc = std.base64.standard.Encoder;
+    const b64 = enc.encode(b64_buf[0..enc.calcSize(bad.len)], &bad);
+
+    var content_buf: [256]u8 = undefined;
+    const content = try std.fmt.bufPrint(&content_buf,
+        \\[shadowsocks]
+        \\enabled = true
+        \\psk = "{s}"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    , .{b64});
+
+    try std.testing.expectError(
+        error.ShadowsocksPskWrongLength,
+        Config.parse(std.testing.allocator, content),
+    );
+}
+
+test "parse config - allowed_hosts with extra commas and whitespace" {
+    const psk_bytes = [_]u8{0x77} ** 32;
+    var psk_b64_buf: [64]u8 = undefined;
+    const enc = std.base64.standard.Encoder;
+    const psk_b64 = enc.encode(psk_b64_buf[0..enc.calcSize(psk_bytes.len)], &psk_bytes);
+
+    var content_buf: [512]u8 = undefined;
+    const content = try std.fmt.bufPrint(&content_buf,
+        \\[shadowsocks]
+        \\enabled = true
+        \\psk = "{s}"
+        \\allowed_hosts = "  telegram.org ,, t.me ,fragment.com,"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    , .{psk_b64});
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), cfg.shadowsocks.allowed_hosts.len);
+    try std.testing.expectEqualStrings("telegram.org", cfg.shadowsocks.allowed_hosts[0]);
+    try std.testing.expectEqualStrings("t.me", cfg.shadowsocks.allowed_hosts[1]);
+    try std.testing.expectEqualStrings("fragment.com", cfg.shadowsocks.allowed_hosts[2]);
 }

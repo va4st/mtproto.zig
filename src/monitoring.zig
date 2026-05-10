@@ -215,6 +215,7 @@ fn writeMetrics(writer: anytype, state: *proxy.ProxyState, process: ProcessMetri
     try writeGauge(writer, "mtproto_desync_enabled", "whether desync is enabled", boolToInt(snapshot.desync_enabled));
     try writeGauge(writer, "mtproto_drs_enabled", "whether dynamic record sizing is enabled", boolToInt(snapshot.drs_enabled));
     try writePerUserMetrics(writer, state);
+    try writeShadowsocksMetrics(writer, state);
 
     if (process.resident_memory_bytes) |value| {
         try writeGauge(writer, "process_resident_memory_bytes", "resident set size", value);
@@ -275,6 +276,24 @@ fn writePerUserMetrics(writer: anytype, state: *proxy.ProxyState) !void {
             entry.upstream_to_client_bytes_total.load(.monotonic),
         );
     }
+}
+
+fn writeShadowsocksMetrics(writer: anytype, state: *proxy.ProxyState) !void {
+    const ss_cfg = state.config.shadowsocks;
+    try writeGauge(writer, "mtproto_ss_enabled", "whether the Shadowsocks-2022 listener is enabled and configured", boolToInt(ss_cfg.isUsable()));
+    try writeGauge(writer, "mtproto_ss_port", "configured Shadowsocks-2022 listen port", ss_cfg.port);
+    try writeGauge(writer, "mtproto_ss_allowed_hosts_count", "number of suffixes in the SS allow-list", ss_cfg.allowed_hosts.len);
+    try writeGauge(writer, "mtproto_ss_block_private", "whether SS blocks RFC1918/loopback/ULA targets", boolToInt(ss_cfg.block_private_networks));
+
+    try writeCounter(writer, "mtproto_ss_connections_accepted_total", "Shadowsocks-2022 connections accepted on the listener", state.stats_ss_accepted.load(.monotonic));
+    try writeCounter(writer, "mtproto_ss_handshake_failed_total", "SS sessions terminated during AEAD handshake", state.stats_ss_handshake_failed.load(.monotonic));
+    try writeCounter(writer, "mtproto_ss_replay_total", "SS sessions rejected by the salt anti-replay cache", state.stats_ss_replay.load(.monotonic));
+    try writeCounter(writer, "mtproto_ss_blocked_host_total", "SS CONNECT requests rejected by the host whitelist", state.stats_ss_blocked_host.load(.monotonic));
+    try writeCounter(writer, "mtproto_ss_blocked_private_total", "SS CONNECT requests rejected because the target was a private network", state.stats_ss_blocked_private.load(.monotonic));
+    try writeCounter(writer, "mtproto_ss_dns_failed_total", "SS CONNECT attempts where DNS resolution failed", state.stats_ss_dns_failed.load(.monotonic));
+    try writeCounter(writer, "mtproto_ss_relayed_total", "SS sessions that successfully reached the relay phase", state.stats_ss_relayed.load(.monotonic));
+    try writeCounter(writer, "mtproto_ss_client_to_upstream_bytes_total", "plaintext bytes forwarded from SS client to upstream", state.stats_ss_c2u_bytes.load(.monotonic));
+    try writeCounter(writer, "mtproto_ss_upstream_to_client_bytes_total", "plaintext bytes forwarded from upstream to SS client (pre-AEAD)", state.stats_ss_u2c_bytes.load(.monotonic));
 }
 
 fn writeLabeledMetricLine(writer: anytype, metric_name: []const u8, user_name: []const u8, value: anytype) !void {
@@ -436,6 +455,11 @@ test "metrics output contains required metrics" {
     try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_connections_active") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_build_info") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_client_to_upstream_bytes_total") != null);
+    // Shadowsocks metrics are always emitted (zero values when disabled).
+    try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_ss_enabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_ss_connections_accepted_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_ss_blocked_host_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_ss_relayed_total") != null);
 }
 
 test "metrics rejects unknown path" {
